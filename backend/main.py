@@ -674,3 +674,129 @@ def _pipeline_thread(video_path: Path, n_keyframes: int, step: int) -> None:
         msg = f"Error interno del pipeline: {type(e).__name__}: {e}"
         JOB.push("error", msg)
         JOB.finish(error=msg)
+
+
+# --------------------------------------------------------------------------------------
+# 6. API HTTP (FastAPI)
+# --------------------------------------------------------------------------------------
+app = FastAPI(title="Spatial Twin API", version="1.0.0",
+              description="Video de smartphone → gemelo digital 3D texturizado (RGB-D real).")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
+                   allow_methods=["*"], allow_headers=["*"], expose_headers=["*"])
+
+ALLOWED_VIDEO_EXT = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".3gp"}
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    if MODEL_GLB.exists() and METADATA_JSON.exists():
+        with JOB.lock:
+            JOB.state, JOB.stage, JOB.progress = "done", "done", 1.0
+        log.info("Modelo previo detectado en %s: el frontend podrá cargarlo directamente.", MODEL_GLB)
+    log.info("Modelo de profundidad: %s (backend=%s)", DEPTH_MODEL, DEPTH_BACKEND)
+
+
+@app.get("/api/health")
+def health() -> dict:
+    info = {"ok": True, "model": DEPTH_MODEL, "backend": DEPTH_BACKEND, "device": "n/a", "torch": None, "cuda": False}
+    try:
+        import torch
+        info.update({"torch": torch.__version__, "cuda": bool(torch.cuda.is_available()),
+                     "device": "cuda" if torch.cuda.is_available() else "cpu"})
+    except Exception:  # noqa: BLE001
+        info["ok"] = DEPTH_BACKEND == "remote"
+    return info
+
+
+@app.post("/api/scan")
+async def scan(file: UploadFile = File(...),
+               frames: int = Query(DEFAULT_KEYFRAMES, ge=1, le=5, description="Número de fotogramas clave (1-5)"),
+               step: int = Query(DEFAULT_MESH_STEP, ge=1, le=8, description="Zancada del grid de la malla en píxeles")) -> JSONResponse:
+    """Recibe el video, lo guarda y lanza el pipeline en un hilo. El progreso real se consulta en /api/status."""
+    if JOB.state == "running":
+        raise HTTPException(status_code=409, detail="Ya hay un escaneo en curso. Espera a que termine.")
+    ext = Path(file.filename or "video.mp4").suffix.lower() or ".mp4"
+    if ext not in ALLOWED_VIDEO_EXT:
+        raise HTTPException(status_code=415, detail=f"Extensión {ext} no soportada. Usa mp4/mov/webm/mkv/avi.")
+
+    job_id = uuid.uuid4().hex[:10]
+    dest = UPLOAD_DIR / f"{job_id}{ext}"
+    size = 0
+    with dest.open("wb") as fh:
+        while chunk := await file.read(4 * 1024 * 1024):
+            fh.write(chunk)
+            size += len(chunk)
+    if size < 1024:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="El archivo está vacío o es demasiado pequeño para ser un video.")
+    shutil.copyfile(dest, VIDEO_COPY)
+
+    JOB.reset(job_id)
+    JOB.push("init", f"Video recibido: {file.filename} ({size / 1e6:.1f} MB). Keyframes={frames}, zancada={step} px", 0.01)
+    threading.Thread(target=_pipeline_thread, args=(dest, frames, step), daemon=True, name=f"pipeline-{job_id}").start()
+    return JSONResponse({"job_id": job_id, "status_url": "/api/status", "bytes": size}, status_code=202)
+
+
+@app.get("/api/status")
+def status() -> dict:
+    return JOB.snapshot()
+
+
+@app.get("/api/model")
+def get_model(format: str = Query("glb", pattern="^(glb|ply)$")) -> FileResponse:
+    path = MODEL_GLB if format == "glb" else MODEL_PLY
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Aún no hay modelo generado. Sube un video en POST /api/scan.")
+    media = "model/gltf-binary" if format == "glb" else "application/octet-stream"
+    return FileResponse(path, media_type=media, filename=path.name,
+                        headers={"Cache-Control": "no-store", "X-Model-Generated": time.strftime("%H:%M:%S", time.localtime(path.stat().st_mtime))})
+
+
+@app.get("/api/metadata")
+def get_metadata() -> JSONResponse:
+    if not METADATA_JSON.exists():
+        raise HTTPException(status_code=404, detail="Sin metadata: todavía no se ha procesado ningún video.")
+    return JSONResponse(json.loads(METADATA_JSON.read_text(encoding="utf-8")), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/video")
+def get_video() -> FileResponse:
+    if not VIDEO_COPY.exists():
+        raise HTTPException(status_code=404, detail="No hay video fuente almacenado.")
+    return FileResponse(VIDEO_COPY, media_type="video/mp4", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/preview/{kind}/{index}")
+def get_preview(kind: str, index: int) -> FileResponse:
+    if kind not in ("frame", "depth"):
+        raise HTTPException(status_code=404, detail="Tipo de preview desconocido.")
+    path = PREVIEW_DIR / f"{kind}_{index}.jpg"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Preview no disponible.")
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/api/model")
+def reset_model() -> dict:
+    """Borra el gemelo actual (útil entre demos)."""
+    if JOB.state == "running":
+        raise HTTPException(status_code=409, detail="No se puede borrar mientras se procesa.")
+    for p in (MODEL_GLB, MODEL_PLY, METADATA_JSON, VIDEO_COPY):
+        p.unlink(missing_ok=True)
+    for p in PREVIEW_DIR.glob("*"):
+        p.unlink(missing_ok=True)
+    with JOB.lock:
+        JOB.state, JOB.stage, JOB.progress, JOB.log, JOB.error = "idle", "", 0.0, [], ""
+    return {"ok": True}
+
+
+# El frontend se sirve desde el mismo origen (un solo comando para la demo). Debe montarse al final.
+if FRONTEND_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    print(f"\n  SPATIAL TWIN  →  http://localhost:{PORT}\n  modelo: {DEPTH_MODEL}\n")
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False, log_level="info")
