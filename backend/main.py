@@ -57,8 +57,10 @@ HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
 CAMERA_HFOV_DEG = float(os.getenv("CAMERA_HFOV", "70"))               # FOV horizontal típico de smartphone
 DEFAULT_KEYFRAMES = int(os.getenv("MAX_KEYFRAMES", "4"))
 DEFAULT_MESH_STEP = int(os.getenv("MESH_STEP", "3"))                  # zancada en píxeles del grid de triángulos
-TEXTURE_MAX = int(os.getenv("TEXTURE_MAX", "960"))                    # lado mayor de la textura por keyframe
-MAX_DEPTH_M = float(os.getenv("MAX_DEPTH", "12.0"))                   # recorte de profundidad (metros)
+TEXTURE_MAX = int(os.getenv("TEXTURE_MAX", "1280"))                    # lado mayor de la textura por keyframe
+MAX_DEPTH_M = float(os.getenv("MAX_DEPTH", "12.0"))
+DEPTH_RES = int(os.getenv("DEPTH_RES", "728"))                       # resolución interna de inferencia (múltiplo de 14)
+HEIGHT_PRIOR_M = float(os.getenv("HEIGHT_PRIOR", "1.55"))             # altura típica del móvil sobre el suelo (calibra la escala)                   # recorte de profundidad (metros)
 CANDIDATE_FRAMES = int(os.getenv("CANDIDATE_FRAMES", "24"))           # fotogramas candidatos a muestrear
 PORT = int(os.getenv("PORT", "8000"))
 
@@ -320,7 +322,7 @@ class DepthEstimator:
         import torch
         self.ensure_loaded()
         pil = Image.fromarray(rgb)
-        inputs = self.processor(images=pil, return_tensors="pt")
+        inputs = self.processor(images=pil, return_tensors="pt", size={"height": DEPTH_RES, "width": DEPTH_RES})
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.inference_mode():
             out = self.model(**inputs)
@@ -521,10 +523,11 @@ def build_frame_mesh(rgb: np.ndarray, depth: np.ndarray, K: np.ndarray, step: in
     a, b, c, d = idx[:-1, :-1], idx[:-1, 1:], idx[1:, :-1], idx[1:, 1:]
     za, zb, zc, zd = Z[:-1, :-1], Z[:-1, 1:], Z[1:, :-1], Z[1:, 1:]
     cell_valid = valid[:-1, :-1] & valid[:-1, 1:] & valid[1:, :-1] & valid[1:, 1:]
+    # Malla CONTINUA: los saltos de profundidad se conservan como triángulos estirados (el frontend los
+    # atenúa en el shader). Recortar producía siluetas negras muy visibles alrededor de personas y muebles.
     zmin = np.minimum(np.minimum(za, zb), np.minimum(zc, zd))
     zmax = np.maximum(np.maximum(za, zb), np.maximum(zc, zd))
-    jump_tol = np.maximum(0.06, 0.08 * zmin)                      # 8 % de la profundidad (mín. 6 cm)
-    ok = cell_valid & ((zmax - zmin) < jump_tol)
+    ok = cell_valid & ((zmax - zmin) < max(MAX_DEPTH_M * 0.6, 3.0))
     if ok.sum() < 8:
         return None
     # dos triángulos por celda, orientados CCW vistos desde la cámara (tras la conversión a OpenGL)
@@ -560,11 +563,28 @@ def export_scene(frame_meshes: list, poses: list, keyframes: list, K: np.ndarray
     scene = trimesh.Scene()
     all_pts, all_cols = [], []
     total_v, total_f = 0, 0
-    for i, (fm, pose) in enumerate(zip(frame_meshes, poses)):
+    # 1) pasar todo a mundo/OpenGL y calibrar la escala con un prior de altura de cámara: el móvil se sostiene
+    #    a ~1.55 m del suelo, así que el 2º percentil de Y (suelo) debe quedar a -HEIGHT_PRIOR_M.
+    gl_list = []
+    for fm, pose in zip(frame_meshes, poses):
         if fm is None:
+            gl_list.append(None)
             continue
         Vw = (pose[:3, :3] @ fm.vertices_cam.T).T + pose[:3, 3]          # cámara_i → mundo (OpenCV)
-        Vgl = (Vw @ CV_TO_GL.T).astype(np.float32)                        # → OpenGL
+        gl_list.append((Vw @ CV_TO_GL.T).astype(np.float32))             # → OpenGL
+    valid_gl = [v for v in gl_list if v is not None]
+    if not valid_gl:
+        raise PipelineError("La reconstrucción no produjo geometría válida (¿video demasiado oscuro o uniforme?).")
+    raw_floor = float(np.percentile(np.concatenate(valid_gl)[:, 1], 2.0))
+    scale = 1.0
+    if raw_floor < -0.2:
+        scale = float(np.clip(HEIGHT_PRIOR_M / (-raw_floor), 0.45, 2.2))
+    poses = [np.diag([scale, scale, scale, 1.0]) @ pose for pose in poses]
+    JOB.push("mesh", f"Escala calibrada por altura de cámara: x{scale:.2f} (suelo crudo a {raw_floor:.2f} m)", 0.61)
+    for i, (fm, Vgl) in enumerate(zip(frame_meshes, gl_list)):
+        if fm is None:
+            continue
+        Vgl = (Vgl * scale).astype(np.float32)
         mesh = trimesh.Trimesh(vertices=Vgl, faces=fm.faces, process=False)
         mesh.visual = trimesh.visual.TextureVisuals(uv=fm.uv, image=fm.texture)
         scene.add_geometry(mesh, node_name=f"keyframe_{i}", geom_name=f"keyframe_{i}")
@@ -608,6 +628,7 @@ def export_scene(frame_meshes: list, poses: list, keyframes: list, K: np.ndarray
         "floor_y": round(floor_y, 3), "ceiling_y": round(ceil_y, 3),
         "eye_height_m": round(float(min(max(0.0 - floor_y, 0.9), 2.2)), 3),
         "point_density_per_m2": round(total_v / footprint, 1),
+        "scale_factor": round(scale, 3), "height_prior_m": HEIGHT_PRIOR_M,
         "mesh_step_px": step, "intrinsics": {"fx": round(float(K[0, 0]), 2), "fy": round(float(K[1, 1]), 2),
                                              "cx": round(float(K[0, 2]), 2), "cy": round(float(K[1, 2]), 2),
                                              "hfov_deg": CAMERA_HFOV_DEG},

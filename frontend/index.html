@@ -272,7 +272,7 @@ h1 span{color:var(--cyan)}
   <div class="cross"><i></i></div>
   <div class="hud-bl">
     <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> moverse &nbsp; <kbd>Shift</kbd> correr &nbsp; <kbd>Espacio</kbd> saltar</div>
-    <div><kbd>M</kbd> malla / puntos &nbsp; <kbd>L</kbd> linterna &nbsp; <kbd>P</kbd> post-FX &nbsp; <kbd>G</kbd> rejilla</div>
+    <div><kbd>M</kbd> malla / puntos &nbsp; <kbd>L</kbd> linterna &nbsp; <kbd>P</kbd> post-FX &nbsp; <kbd>G</kbd> rejilla &nbsp; <kbd>F</kbd> cámaras</div>
     <div><kbd>N</kbd> vuelo libre &nbsp; <kbd>Q</kbd><kbd>E</kbd> subir / bajar &nbsp; <kbd>R</kbd> reiniciar &nbsp; <kbd>Esc</kbd> menú</div>
   </div>
   <div class="hud-br">
@@ -322,7 +322,7 @@ function toast(msg) {
 // ------------------------------------------------------------------ estado de la aplicación
 const app = {
   view: 'landing', meta: null, model: null, videoURL: null, frames: 4, step: 3,
-  mode: 'mesh', fx: true, light: false, grid: true, fly: false, entered: false,
+  mode: 'mesh', fx: true, light: false, grid: true, frusta: false, fly: false, entered: false,
   reveal: 0, revealTarget: 0, revealing: false, lastLogCount: 0, pollTimer: 0,
 };
 
@@ -460,8 +460,14 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x05070a);
-scene.fog = new THREE.FogExp2(0x05070a, 0.035);
+scene.fog = new THREE.FogExp2(0x0a1017, 0.028);
+const dome = new THREE.Mesh(new THREE.SphereGeometry(90, 32, 16), new THREE.ShaderMaterial({ side: THREE.BackSide, depthWrite: false, fog: false,
+  vertexShader: `varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+  fragmentShader: `varying vec3 vP; void main(){ float t = clamp(vP.y / 90.0 * 0.5 + 0.5, 0.0, 1.0);
+    vec3 c = mix(vec3(0.016,0.022,0.03), vec3(0.07,0.10,0.14), smoothstep(0.35, 0.75, t));
+    c = mix(c, vec3(0.03,0.06,0.08), smoothstep(0.42, 0.5, t) * (1.0 - smoothstep(0.5, 0.58, t)) * 0.8);
+    gl_FragColor = vec4(c, 1.0); }` }));
+scene.add(dome);
 const camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.03, 200);
 camera.position.set(0, 0, 0);
 
@@ -484,13 +490,16 @@ function patchMeshMaterial(mat) {
   mat.onBeforeCompile = (sh) => {
     sh.uniforms.uReveal = shared.uReveal; sh.uniforms.uTime = shared.uTime;
     sh.vertexShader = sh.vertexShader
-      .replace('#include <common>', '#include <common>\nvarying vec3 vWPos;')
-      .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\nvWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+      .replace('#include <common>', '#include <common>\nvarying vec3 vWPos; varying float vViewZ;')
+      .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\nvWPos = (modelMatrix * vec4(transformed, 1.0)).xyz; vViewZ = -mvPosition.z;');
     sh.fragmentShader = sh.fragmentShader
-      .replace('#include <common>', '#include <common>\nuniform float uReveal; uniform float uTime; varying vec3 vWPos;')
+      .replace('#include <common>', '#include <common>\nuniform float uReveal; uniform float uTime; varying vec3 vWPos; varying float vViewZ;')
       .replace('#include <dithering_fragment>', `#include <dithering_fragment>
         float dR = length(vWPos - cameraPosition);
         if (dR > uReveal) discard;
+        float rel = fwidth(vViewZ) / max(vViewZ, 0.05);                  // triángulos estirados entre planos
+        float smear = smoothstep(0.035, 0.14, rel);
+        gl_FragColor.rgb = mix(gl_FragColor.rgb, gl_FragColor.rgb * 0.22 + vec3(0.01, 0.03, 0.04), smear);
         float edge = 1.0 - smoothstep(0.0, 0.45, uReveal - dR);           // frente de onda láser
         float scan = 0.5 + 0.5 * sin(vWPos.y * 90.0 - uTime * 6.0);
         float near = 1.0 - smoothstep(0.0, 2.5, uReveal - dR);             // scanlines solo tras el frente
@@ -565,11 +574,12 @@ function installModel(root, meta) {
   grid.material.transparent = true; grid.material.opacity = 0.35; grid.position.set((g.bbox_min[0] + g.bbox_max[0]) / 2, g.floor_y + 0.01, (g.bbox_min[2] + g.bbox_max[2]) / 2);
   grid.name = 'grid'; helpers.add(grid);
   const frCol = new THREE.LineBasicMaterial({ color: 0xffb547, transparent: true, opacity: 0.85 });
+  const frusta = new THREE.Group(); frusta.name = 'frusta'; frusta.visible = app.frusta; helpers.add(frusta);
   for (const c of g.cameras) {
     const fr = new THREE.LineSegments(frustumGeometry(0.28, 0.16, 0.22), frCol);
     fr.position.fromArray(c.position);
     const fwd = new THREE.Vector3().fromArray(c.forward).normalize();
-    fr.lookAt(fr.position.clone().add(fwd)); helpers.add(fr);
+    fr.lookAt(fr.position.clone().add(fwd)); frusta.add(fr);
   }
   shared.uReveal.value = 0; app.revealTarget = bboxDiag + 4; app.entered = false;
   resetPlayer();
@@ -584,10 +594,10 @@ function frustumGeometry(d, w, h) {
 // ------------------------------------------------------------------ post-procesado
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
-const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.32, 0.55, 0.82);
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.22, 0.5, 0.88);
 composer.addPass(bloom);
 const fxPass = new ShaderPass({
-  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uAberration: { value: 0.0016 } },
+  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uAberration: { value: 0.0007 } },
   vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
   fragmentShader: `uniform sampler2D tDiffuse; uniform float uTime; uniform float uAberration; varying vec2 vUv;
     void main(){ vec2 d = (vUv - 0.5); float r2 = dot(d,d);
@@ -613,6 +623,7 @@ document.addEventListener('keydown', (e) => {
     case 'KeyM': setMode(app.mode === 'mesh' ? 'points' : 'mesh'); break;
     case 'KeyP': app.fx = !app.fx; $('h-fx').textContent = app.fx ? 'ON' : 'OFF'; toast(`Post-FX ${app.fx ? 'activado' : 'desactivado'}`); break;
     case 'KeyL': app.light = !app.light; flashlight.intensity = app.light ? 90 : 0; $('h-light').textContent = app.light ? 'ON' : 'OFF'; toast(`Linterna ${app.light ? 'encendida' : 'apagada'}`); break;
+    case 'KeyF': app.frusta = !app.frusta; helpers.getObjectByName('frusta').visible = app.frusta; toast(`Cámaras del recorrido ${app.frusta ? 'visibles' : 'ocultas'}`); break;
     case 'KeyG': app.grid = !app.grid; helpers.getObjectByName('grid').visible = app.grid; toast(`Rejilla ${app.grid ? 'visible' : 'oculta'}`); break;
     case 'KeyN': app.fly = !app.fly; vy = 0; toast(app.fly ? 'Vuelo libre · colisiones desactivadas' : 'Modo caminar'); break;
     case 'KeyR': resetPlayer(); toast('Posición reiniciada en la cámara 0'); break;
