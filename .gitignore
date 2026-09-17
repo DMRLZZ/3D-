@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Artefactos generados por el pipeline (video subido, GLB, PLY, previews)
+backend/uploads/
+backend/output/
+
+# Caché de modelos HuggingFace si se fuerza local
+.hf_cache/
+
+# Logs
+*.log
+.pip_*.log
+
+# SO / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
