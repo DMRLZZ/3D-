@@ -477,6 +477,7 @@ def register_keyframes(keyframes: list, K: np.ndarray, frame_w: int) -> tuple[li
             stats.append({"method": "fallback_fan", "inliers": 0, "matches": 0, "fan_deg": round(math.degrees(spacing), 1)})
             JOB.push("register", f"Keyframe {i}: solape insuficiente para PnP, colocado en abanico (+{math.degrees(spacing):.0f} grados)",
                      0.5 + 0.08 * i / len(keyframes))
+        poses.append(pose)
     if len(poses) > 1 and all(st["method"] != "pnp_ransac" for st in stats[1:]):
         recenter = rot_y(-spacing * (len(poses) - 1) / 2.0)             # centra el panorama frente al usuario
         poses = [recenter @ p for p in poses]
