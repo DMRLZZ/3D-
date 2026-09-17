@@ -247,3 +247,219 @@ def extract_keyframes(video_path: Path, k: int) -> tuple[list, dict]:
     }
     JOB.push("frames", f"Keyframes elegidos: {info['selected']} (t = {info['selected_times_s']} s)", 0.14)
     return keyframes, info
+
+
+# --------------------------------------------------------------------------------------
+# 2. Profundidad métrica monocular (Depth Anything V2 · HuggingFace transformers)
+# --------------------------------------------------------------------------------------
+class DepthEstimator:
+    """
+    Singleton perezoso. Backend 'local' usa transformers + torch (CPU o CUDA).
+    Backend 'remote' usa la Inference API de HuggingFace (requiere HF_TOKEN) para máquinas sin GPU/torch.
+    Devuelve profundidad en METROS (HxW float32). Para modelos relativos (MiDaS, DA-V2 no métrico)
+    convierte la disparidad a profundidad y la escala heurísticamente a una habitación típica.
+    """
+
+    _instance: Optional["DepthEstimator"] = None
+    _lock = threading.Lock()
+
+    def __init__(self) -> None:
+        self.model = None
+        self.processor = None
+        self.device = "cpu"
+        self.is_metric = "metric" in DEPTH_MODEL.lower()
+        self.backend = DEPTH_BACKEND
+        self.load_time = 0.0
+
+    @classmethod
+    def get(cls) -> "DepthEstimator":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = DepthEstimator()
+            return cls._instance
+
+    def ensure_loaded(self) -> None:
+        if self.backend == "remote" or self.model is not None:
+            return
+        t0 = time.time()
+        try:
+            import torch
+            from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+        except ImportError as e:  # pragma: no cover
+            raise PipelineError(f"Faltan dependencias de inferencia ({e}). Ejecuta: pip install -r requirements.txt") from e
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        if self.device == "cpu":
+            torch.set_num_threads(max(1, (os.cpu_count() or 4)))
+        JOB.push("depth", f"Cargando modelo {DEPTH_MODEL} en {self.device.upper()}...", 0.16)
+        try:
+            self.processor = AutoImageProcessor.from_pretrained(DEPTH_MODEL, token=HF_TOKEN)
+            self.model = AutoModelForDepthEstimation.from_pretrained(DEPTH_MODEL, token=HF_TOKEN).to(self.device).eval()
+        except Exception as e:
+            raise PipelineError(f"No se pudo cargar el modelo de profundidad {DEPTH_MODEL}: {e}. "
+                                f"Revisa la conexión a HuggingFace o define DEPTH_BACKEND=remote con HF_TOKEN.") from e
+        self.load_time = time.time() - t0
+        n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
+        JOB.push("depth", f"Modelo listo en {self.load_time:.1f} s ({n_params:.1f} M parámetros)", 0.2)
+
+    # ---- inferencia -------------------------------------------------------------
+    def predict(self, rgb: np.ndarray) -> np.ndarray:
+        h, w = rgb.shape[:2]
+        raw = self._predict_remote(rgb) if self.backend == "remote" else self._predict_local(rgb)
+        raw = cv2.resize(raw.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
+        return self._to_metric(raw)
+
+    def _predict_local(self, rgb: np.ndarray) -> np.ndarray:
+        import torch
+        self.ensure_loaded()
+        pil = Image.fromarray(rgb)
+        inputs = self.processor(images=pil, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.inference_mode():
+            out = self.model(**inputs)
+        pred = out.predicted_depth
+        if pred.ndim == 3:
+            pred = pred[0]
+        return pred.detach().float().cpu().numpy()
+
+    def _predict_remote(self, rgb: np.ndarray) -> np.ndarray:
+        if not HF_TOKEN:
+            raise PipelineError("DEPTH_BACKEND=remote requiere la variable HF_TOKEN.")
+        try:
+            from huggingface_hub import InferenceClient
+        except ImportError as e:
+            raise PipelineError("Instala huggingface_hub para usar el backend remoto.") from e
+        client = InferenceClient(token=HF_TOKEN)
+        buf = io.BytesIO()
+        Image.fromarray(rgb).save(buf, format="JPEG", quality=92)
+        model_id = DEPTH_MODEL if "metric" not in DEPTH_MODEL.lower() else "depth-anything/Depth-Anything-V2-Small-hf"
+        result = client.depth_estimation(buf.getvalue(), model=model_id)
+        img = result if isinstance(result, Image.Image) else Image.open(io.BytesIO(result))
+        arr = np.asarray(img).astype(np.float32)
+        if arr.ndim == 3:
+            arr = arr[..., 0]
+        self.is_metric = False   # la API devuelve un mapa relativo normalizado
+        return arr
+
+    def _to_metric(self, raw: np.ndarray) -> np.ndarray:
+        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.is_metric:
+            depth = raw
+        else:
+            # Modelos relativos devuelven disparidad (inversa). Convertimos y escalamos para que la
+            # mediana de la escena quede a ~2.5 m: heurística razonable para interiores.
+            disp = np.clip(raw, 1e-3, None)
+            depth = 1.0 / disp
+            med = float(np.median(depth[depth > 0])) if np.any(depth > 0) else 1.0
+            depth = depth * (2.5 / max(med, 1e-6))
+        depth = np.clip(depth, 0.0, MAX_DEPTH_M).astype(np.float32)
+        return cv2.bilateralFilter(depth, d=5, sigmaColor=0.08, sigmaSpace=3)   # suaviza ruido, respeta bordes
+
+
+def estimate_depths(keyframes: list) -> dict:
+    est = DepthEstimator.get()
+    est.ensure_loaded()
+    times = []
+    for i, kf in enumerate(keyframes):
+        t0 = time.time()
+        kf.depth = est.predict(kf.rgb)
+        dt = time.time() - t0
+        times.append(round(dt, 2))
+        valid = kf.depth[kf.depth > 0.05]
+        rng = (float(valid.min()), float(valid.max())) if valid.size else (0.0, 0.0)
+        JOB.push("depth", f"Keyframe {i + 1}/{len(keyframes)}: profundidad {rng[0]:.2f}-{rng[1]:.2f} m en {dt:.2f} s",
+                 0.2 + 0.3 * (i + 1) / len(keyframes))
+    return {"model": DEPTH_MODEL, "backend": est.backend, "device": est.device, "metric": est.is_metric,
+            "inference_s": times, "model_load_s": round(est.load_time, 2)}
+
+
+# --------------------------------------------------------------------------------------
+# 3. Cámara e intrínsecos + registro multi-vista (ORB + PnP RANSAC)
+# --------------------------------------------------------------------------------------
+def intrinsics_for(w: int, h: int) -> np.ndarray:
+    """Matriz K estimada a partir del FOV horizontal del smartphone (píxeles cuadrados, centro óptico en el centro)."""
+    fx = 0.5 * w / math.tan(math.radians(CAMERA_HFOV_DEG) / 2.0)
+    return np.array([[fx, 0.0, w / 2.0], [0.0, fx, h / 2.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def unproject(u: np.ndarray, v: np.ndarray, z: np.ndarray, K: np.ndarray) -> np.ndarray:
+    """Desproyección pinhole: X=(u-cx)·Z/fx, Y=(v-cy)·Z/fy (convención OpenCV: X derecha, Y abajo, Z delante)."""
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    return np.stack([(u - cx) * z / fx, (v - cy) * z / fy, z], axis=-1)
+
+
+def relative_pose_pnp(kf_a, kf_b, K: np.ndarray) -> Optional[dict]:
+    """
+    Estima T_b<-a (4x4) que lleva puntos del sistema de la cámara A al de la cámara B.
+    Usa correspondencias ORB A<->B, levanta los puntos de A a 3D con su profundidad métrica
+    y resuelve PnP con RANSAC contra los píxeles de B. Devuelve None si no hay geometría fiable.
+    """
+    gray_a = cv2.cvtColor(kf_a.rgb, cv2.COLOR_RGB2GRAY)
+    gray_b = cv2.cvtColor(kf_b.rgb, cv2.COLOR_RGB2GRAY)
+    orb = cv2.ORB_create(nfeatures=4000, scaleFactor=1.2, nlevels=8, fastThreshold=12)
+    kpa, da = orb.detectAndCompute(gray_a, None)
+    kpb, db = orb.detectAndCompute(gray_b, None)
+    if da is None or db is None or len(kpa) < 30 or len(kpb) < 30:
+        return None
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    knn = matcher.knnMatch(da, db, k=2)
+    good = [pair[0] for pair in knn if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance]
+    if len(good) < 20:
+        return None
+
+    pts_a = np.float32([kpa[m.queryIdx].pt for m in good])
+    pts_b = np.float32([kpb[m.trainIdx].pt for m in good])
+    h, w = kf_a.depth.shape
+    ui = np.clip(pts_a[:, 0].round().astype(int), 0, w - 1)
+    vi = np.clip(pts_a[:, 1].round().astype(int), 0, h - 1)
+    z = kf_a.depth[vi, ui]
+    ok_z = (z > 0.15) & (z < MAX_DEPTH_M * 0.95)
+    if ok_z.sum() < 20:
+        return None
+    obj = unproject(pts_a[ok_z, 0].astype(np.float64), pts_a[ok_z, 1].astype(np.float64), z[ok_z].astype(np.float64), K)
+    img = pts_b[ok_z].astype(np.float64)
+
+    success, rvec, tvec, inliers = cv2.solvePnPRansac(
+        obj.reshape(-1, 1, 3), img.reshape(-1, 1, 2), K, None,
+        iterationsCount=1000, reprojectionError=4.0, confidence=0.999, flags=cv2.SOLVEPNP_EPNP)
+    if not success or inliers is None or len(inliers) < 15:
+        return None
+    inl = inliers.ravel()
+    # refinamiento Levenberg-Marquardt sobre los inliers
+    rvec, tvec = cv2.solvePnPRefineLM(obj[inl].reshape(-1, 1, 3), img[inl].reshape(-1, 1, 2), K, None, rvec, tvec)
+    R, _ = cv2.Rodrigues(rvec)
+    t = tvec.reshape(3)
+    if not np.all(np.isfinite(R)) or np.linalg.norm(t) > 6.0:     # un paso de >6 m entre keyframes no es plausible
+        return None
+    T = np.eye(4)
+    T[:3, :3], T[:3, 3] = R, t
+    return {"T_b_from_a": T, "inliers": int(len(inl)), "matches": int(len(good)),
+            "translation_m": round(float(np.linalg.norm(t)), 3),
+            "rotation_deg": round(float(np.degrees(np.linalg.norm(rvec))), 1)}
+
+
+def register_keyframes(keyframes: list, K: np.ndarray) -> tuple[list, list]:
+    """
+    Encadena poses: mundo = cámara del keyframe 0. Para cada par consecutivo intenta PnP;
+    si falla, cae a un abanico rotacional (30° alrededor de Y) para que la escena siga siendo explorable.
+    Devuelve lista de matrices 4x4 'mundo<-cámara_i' y estadísticas de registro por keyframe.
+    """
+    poses = [np.eye(4)]
+    stats = [{"method": "origin", "inliers": 0, "matches": 0}]
+    for i in range(1, len(keyframes)):
+        rel = relative_pose_pnp(keyframes[i - 1], keyframes[i], K)
+        if rel is not None:
+            pose = poses[-1] @ np.linalg.inv(rel["T_b_from_a"])
+            stats.append({"method": "pnp_ransac", **{k: v for k, v in rel.items() if k != "T_b_from_a"}})
+            JOB.push("register", f"Keyframe {i} registrado por PnP: {rel['inliers']}/{rel['matches']} inliers, "
+                                 f"|t|={rel['translation_m']} m, rot={rel['rotation_deg']} grados",
+                     0.5 + 0.08 * i / len(keyframes))
+        else:
+            ang = math.radians(30.0)
+            Ry = np.array([[math.cos(ang), 0, math.sin(ang), 0], [0, 1, 0, 0],
+                           [-math.sin(ang), 0, math.cos(ang), 0], [0, 0, 0, 1]])
+            pose = poses[-1] @ Ry
+            stats.append({"method": "fallback_fan", "inliers": 0, "matches": 0})
+            JOB.push("register", f"Keyframe {i}: sin geometría fiable, colocado en abanico (+30 grados)",
+                     0.5 + 0.08 * i / len(keyframes))
+        poses.append(pose)
+    return poses, stats
