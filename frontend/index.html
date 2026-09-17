@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SPATIAL TWIN · Gemelo digital explorable</title>
+<meta name="description" content="Convierte un video de smartphone en un entorno 3D fotorrealista explorable en primera persona." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet" />
+<style>
+/* ============================================================================
+   SPATIAL TWIN · hoja de estilos
+   Paleta: fondo carbón, cian láser, ámbar de telemetría. Tipografía mono para datos.
+   ========================================================================== */
+:root{
+  --bg:#05070a; --bg-2:#0b1016; --line:rgba(56,240,255,.16); --line-strong:rgba(56,240,255,.45);
+  --cyan:#38f0ff; --cyan-dim:rgba(56,240,255,.55); --amber:#ffb547; --red:#ff5c6c; --green:#5dffb0;
+  --text:#dfe7ee; --muted:#7f8ea0; --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+  --sans:'Space Grotesk',system-ui,-apple-system,Segoe UI,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--sans);overflow:hidden;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+[hidden]{display:none!important}
+
+/* ---------- lienzo WebGL y capas globales ---------- */
+#gl{position:fixed;inset:0;width:100%;height:100%;display:block;outline:0}
+#vignette{position:fixed;inset:0;pointer-events:none;z-index:2;
+  background:radial-gradient(ellipse at center,transparent 55%,rgba(0,0,0,.55) 100%)}
+#scanlines{position:fixed;inset:0;pointer-events:none;z-index:3;opacity:.35;mix-blend-mode:overlay;
+  background:repeating-linear-gradient(0deg,rgba(255,255,255,.04) 0 1px,transparent 1px 3px)}
+
+/* rejilla de calibración láser (landing + procesado) */
+#laser{position:fixed;inset:0;z-index:1;pointer-events:none;overflow:hidden;perspective:700px;transition:opacity .9s ease}
+#laser.off{opacity:0}
+#laser .floor{position:absolute;left:-50%;right:-50%;bottom:-10%;height:70%;transform-origin:50% 100%;
+  transform:rotateX(68deg);background-image:
+  linear-gradient(var(--line-strong) 1px,transparent 1px),linear-gradient(90deg,var(--line-strong) 1px,transparent 1px);
+  background-size:64px 64px;animation:gridflow 4s linear infinite;
+  mask-image:linear-gradient(to top,rgba(0,0,0,.9),transparent 90%);-webkit-mask-image:linear-gradient(to top,rgba(0,0,0,.9),transparent 90%)}
+#laser .ceil{position:absolute;left:-50%;right:-50%;top:-10%;height:55%;transform-origin:50% 0;
+  transform:rotateX(-68deg);background-image:
+  linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:64px 64px;animation:gridflow 6s linear infinite reverse;
+  mask-image:linear-gradient(to bottom,rgba(0,0,0,.8),transparent 90%);-webkit-mask-image:linear-gradient(to bottom,rgba(0,0,0,.8),transparent 90%)}
+#laser .sweep{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--cyan),transparent);
+  box-shadow:0 0 24px 4px rgba(56,240,255,.35);animation:sweep 3.4s cubic-bezier(.4,0,.2,1) infinite}
+#laser .horizon{position:absolute;left:0;right:0;top:50%;height:1px;background:linear-gradient(90deg,transparent,var(--line-strong),transparent)}
+@keyframes gridflow{from{background-position:0 0}to{background-position:0 64px}}
+@keyframes sweep{0%{top:-2%;opacity:0}8%{opacity:1}92%{opacity:1}100%{top:102%;opacity:0}}
+
+/* ---------- panel central (landing / progreso / listo) ---------- */
+.panel{position:fixed;inset:0;z-index:10;display:grid;place-items:center;padding:24px;
+  background:radial-gradient(ellipse at 50% 30%,rgba(56,240,255,.06),transparent 60%)}
+.panel.fade{animation:panelout .6s ease forwards}
+@keyframes panelout{to{opacity:0;transform:scale(1.02);visibility:hidden}}
+.card{width:min(760px,100%);border:1px solid var(--line);background:linear-gradient(180deg,rgba(11,16,22,.92),rgba(5,7,10,.94));
+  backdrop-filter:blur(14px);position:relative;padding:28px 30px 26px;box-shadow:0 30px 80px rgba(0,0,0,.6),inset 0 0 0 1px rgba(255,255,255,.02)}
+.card::before,.card::after,.corner::before,.corner::after{content:"";position:absolute;width:18px;height:18px;border-color:var(--cyan);border-style:solid}
+.card::before{top:-1px;left:-1px;border-width:2px 0 0 2px}.card::after{top:-1px;right:-1px;border-width:2px 2px 0 0}
+.corner::before{bottom:-1px;left:-1px;border-width:0 0 2px 2px}.corner::after{bottom:-1px;right:-1px;border-width:0 2px 2px 0}
+.brand{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px;font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.brand b{color:var(--text);font-weight:700;display:inline-flex;align-items:center;gap:10px}
+.brand b i{display:inline-block;width:10px;height:10px;background:var(--cyan);transform:rotate(45deg);box-shadow:0 0 14px var(--cyan)}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:4px 10px;border:1px solid var(--line);font-family:var(--mono);font-size:11px;letter-spacing:.08em;color:var(--muted)}
+.chip .dot{width:7px;height:7px;border-radius:50%;background:var(--muted);box-shadow:0 0 8px currentColor}
+.chip.ok .dot{background:var(--green);color:var(--green)}.chip.bad .dot{background:var(--red);color:var(--red)}
+h1{font-size:clamp(28px,4.2vw,44px);line-height:1.02;letter-spacing:-.02em;font-weight:700;margin-bottom:10px}
+h1 span{color:var(--cyan)}
+.lead{color:var(--muted);font-size:15px;line-height:1.5;max-width:56ch;margin-bottom:22px}
+
+/* dropzone */
+#dropzone{position:relative;border:1px dashed var(--line-strong);padding:34px 24px;text-align:center;cursor:pointer;
+  background:linear-gradient(180deg,rgba(56,240,255,.03),transparent);transition:border-color .2s,background .2s}
+#dropzone:hover,#dropzone.over{border-color:var(--cyan);background:rgba(56,240,255,.06)}
+#dropzone .ico{font-family:var(--mono);font-size:34px;color:var(--cyan);line-height:1;margin-bottom:10px;text-shadow:0 0 18px rgba(56,240,255,.6)}
+#dropzone p{font-size:15px}#dropzone small{display:block;margin-top:6px;color:var(--muted);font-family:var(--mono);font-size:11px;letter-spacing:.06em}
+#file{position:absolute;inset:0;opacity:0;cursor:pointer}
+.opts{display:flex;gap:14px;align-items:center;justify-content:space-between;margin-top:16px;flex-wrap:wrap}
+.opt{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase}
+.seg{display:inline-flex;border:1px solid var(--line)}
+.seg button{padding:6px 11px;font-family:var(--mono);font-size:12px;color:var(--muted);border-right:1px solid var(--line)}
+.seg button:last-child{border-right:0}.seg button.on{color:var(--bg);background:var(--cyan);font-weight:700}
+.btn{display:inline-flex;align-items:center;gap:10px;padding:13px 22px;font-family:var(--mono);font-size:13px;letter-spacing:.12em;text-transform:uppercase;
+  border:1px solid var(--cyan);color:var(--cyan);position:relative;overflow:hidden;transition:color .2s}
+.btn::before{content:"";position:absolute;inset:0;background:var(--cyan);transform:translateX(-101%);transition:transform .25s cubic-bezier(.2,.8,.2,1);z-index:-1}
+.btn:hover{color:var(--bg)}.btn:hover::before{transform:translateX(0)}
+.btn.primary{color:var(--bg);background:var(--cyan);font-weight:700;box-shadow:0 0 30px rgba(56,240,255,.35)}
+.btn.primary:hover{filter:brightness(1.1)}
+.btn.ghost{border-color:var(--line);color:var(--muted)}.btn.ghost:hover{color:var(--bg)}
+
+/* progreso */
+.stages{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin:6px 0 14px}
+.stage{padding:9px 10px;border:1px solid var(--line);font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);position:relative;overflow:hidden}
+.stage em{display:block;font-style:normal;color:var(--text);font-size:12px;margin-top:3px}
+.stage.active{border-color:var(--cyan);color:var(--cyan)}
+.stage.active::after{content:"";position:absolute;left:0;bottom:0;height:2px;width:40%;background:var(--cyan);animation:stagebar 1.1s ease-in-out infinite alternate}
+.stage.done{border-color:rgba(93,255,176,.4);color:var(--green)}
+@keyframes stagebar{from{transform:translateX(0)}to{transform:translateX(150%)}}
+.bar{height:6px;background:rgba(255,255,255,.06);position:relative;overflow:hidden;margin-bottom:12px}
+.bar i{position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,var(--cyan-dim),var(--cyan));box-shadow:0 0 16px var(--cyan);transition:width .35s ease}
+.meter{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.08em;margin-bottom:10px}
+.meter b{color:var(--cyan)}
+#console{height:190px;overflow-y:auto;border:1px solid var(--line);background:rgba(0,0,0,.45);padding:10px 12px;font-family:var(--mono);font-size:11.5px;line-height:1.55;color:#b7c5d1;scrollbar-width:thin}
+#console .l{display:flex;gap:10px;white-space:pre-wrap;word-break:break-word;animation:linein .25s ease}
+#console .l .t{color:var(--muted);flex:0 0 58px}#console .l .s{color:var(--amber);flex:0 0 74px;text-transform:uppercase}
+#console .l.err .s,#console .l.err .m{color:var(--red)}
+@keyframes linein{from{opacity:0;transform:translateX(-4px)}to{opacity:1}}
+
+/* listo */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:14px 0 18px}
+.stat{border:1px solid var(--line);padding:10px 12px}
+.stat small{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+.stat b{font-family:var(--mono);font-size:17px;color:var(--cyan);font-weight:500}
+.stat b u{text-decoration:none;color:var(--muted);font-size:11px;margin-left:3px}
+.strip{display:flex;gap:6px;margin-bottom:18px}
+.tile{flex:1;aspect-ratio:9/12;position:relative;overflow:hidden;border:1px solid var(--line);background:#000}
+.tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.tile img.d{animation:flip 3.2s ease-in-out infinite}
+.tile span{position:absolute;left:6px;bottom:5px;font-family:var(--mono);font-size:9.5px;letter-spacing:.1em;color:var(--cyan);text-shadow:0 0 6px #000}
+@keyframes flip{0%,40%{opacity:0}50%,90%{opacity:1}100%{opacity:0}}
+.row{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.hint{font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.06em}
+.error{border:1px solid rgba(255,92,108,.5);background:rgba(255,92,108,.08);padding:12px 14px;font-family:var(--mono);font-size:12px;color:#ffb3bb;margin-bottom:14px}
+
+/* ---------- HUD en el mundo ---------- */
+#hud{position:fixed;inset:0;z-index:5;pointer-events:none;font-family:var(--mono);opacity:0;transition:opacity .8s ease}
+#hud.on{opacity:1}
+.frame{position:absolute;inset:18px;border:1px solid rgba(56,240,255,.08)}
+.frame::before,.frame::after,.frame2::before,.frame2::after{content:"";position:absolute;width:26px;height:26px;border:2px solid var(--cyan);opacity:.75}
+.frame::before{top:-1px;left:-1px;border-right:0;border-bottom:0}.frame::after{top:-1px;right:-1px;border-left:0;border-bottom:0}
+.frame2{position:absolute;inset:18px}
+.frame2::before{bottom:-1px;left:-1px;border-right:0;border-top:0}.frame2::after{bottom:-1px;right:-1px;border-left:0;border-top:0}
+.hud-tl{position:absolute;top:34px;left:36px}
+.hud-tl .title{font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--text);display:flex;gap:10px;align-items:center}
+.hud-tl .title i{width:9px;height:9px;background:var(--cyan);transform:rotate(45deg);box-shadow:0 0 10px var(--cyan);animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.35}}
+.hud-tl .sub{margin-top:6px;font-size:10.5px;letter-spacing:.1em;color:var(--muted);display:flex;gap:14px}
+.hud-tl .sub b{color:var(--amber);font-weight:500}
+.hud-tr{position:absolute;top:34px;right:36px;text-align:right;min-width:250px}
+.tele{display:grid;grid-template-columns:auto auto;gap:3px 14px;font-size:11px;letter-spacing:.06em}
+.tele span{color:var(--muted);text-align:left;text-transform:uppercase;font-size:10px;letter-spacing:.12em;padding-top:1px}
+.tele b{color:var(--cyan);font-weight:500;font-variant-numeric:tabular-nums}
+.tele b.amber{color:var(--amber)}.tele b.green{color:var(--green)}
+.hud-bl{position:absolute;left:36px;bottom:34px;font-size:10.5px;letter-spacing:.08em;color:var(--muted);line-height:1.9}
+.hud-bl kbd{display:inline-block;min-width:20px;padding:1px 5px;border:1px solid var(--line-strong);color:var(--text);font-family:inherit;font-size:10px;text-align:center;margin-right:4px}
+.hud-br{position:absolute;right:36px;bottom:34px;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
+.pip{position:relative;width:200px;border:1px solid var(--line-strong);background:#000;box-shadow:0 10px 40px rgba(0,0,0,.6)}
+.pip video{display:block;width:100%;max-height:300px;object-fit:cover;filter:saturate(1.05)}
+.pip .lab{position:absolute;top:6px;left:8px;font-size:9.5px;letter-spacing:.16em;color:var(--amber);text-shadow:0 0 6px #000;display:flex;gap:6px;align-items:center}
+.pip .lab i{width:6px;height:6px;border-radius:50%;background:var(--red);box-shadow:0 0 8px var(--red);animation:pulse 1.2s infinite}
+.pip .lab2{position:absolute;bottom:6px;right:8px;font-size:9.5px;letter-spacing:.16em;color:var(--cyan);text-shadow:0 0 6px #000}
+.ministrip{display:flex;gap:4px;width:200px}
+.ministrip .tile{aspect-ratio:9/13}
+.compass{position:absolute;top:34px;left:50%;transform:translateX(-50%);width:320px;height:26px;overflow:hidden;
+  mask-image:linear-gradient(90deg,transparent,#000 20%,#000 80%,transparent);-webkit-mask-image:linear-gradient(90deg,transparent,#000 20%,#000 80%,transparent)}
+.compass .ticks{position:absolute;top:0;height:100%;display:flex;white-space:nowrap;will-change:transform}
+.compass .tk{width:40px;flex:0 0 40px;text-align:center;font-size:10px;color:var(--muted);letter-spacing:.1em;position:relative;padding-top:12px}
+.compass .tk::before{content:"";position:absolute;top:0;left:50%;width:1px;height:8px;background:var(--line-strong)}
+.compass .tk.card{color:var(--cyan);font-weight:700}
+.compass .needle{position:absolute;left:50%;top:0;width:1px;height:100%;background:var(--amber);box-shadow:0 0 8px var(--amber)}
+.compass .deg{position:absolute;left:50%;transform:translateX(-50%);bottom:-16px;font-size:10px;color:var(--amber)}
+.cross{position:absolute;left:50%;top:50%;width:26px;height:26px;transform:translate(-50%,-50%)}
+.cross::before,.cross::after{content:"";position:absolute;background:var(--cyan);opacity:.85;box-shadow:0 0 6px var(--cyan)}
+.cross::before{left:50%;top:0;width:1px;height:100%;transform:translateX(-50%)}
+.cross::after{top:50%;left:0;height:1px;width:100%;transform:translateY(-50%)}
+.cross i{position:absolute;inset:9px;border:1px solid rgba(56,240,255,.5);border-radius:50%}
+#toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%) translateY(10px);z-index:20;pointer-events:none;
+  font-family:var(--mono);font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--cyan);
+  border:1px solid var(--line-strong);background:rgba(5,7,10,.85);padding:8px 16px;opacity:0;transition:opacity .25s,transform .25s}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#paused{position:fixed;inset:0;z-index:8;display:grid;place-items:center;pointer-events:none;background:rgba(5,7,10,.35);backdrop-filter:blur(2px)}
+#paused .box{text-align:center;font-family:var(--mono);letter-spacing:.14em;text-transform:uppercase}
+#paused .box b{display:block;font-size:20px;color:var(--cyan);margin-bottom:8px;text-shadow:0 0 20px rgba(56,240,255,.6)}
+#paused .box small{color:var(--muted);font-size:11px}
+@media (max-width:760px){.stages{grid-template-columns:repeat(2,1fr)}.stats{grid-template-columns:repeat(2,1fr)}.hud-br,.hud-bl,.compass{display:none}.hud-tr{top:auto;bottom:34px;left:36px;right:auto;text-align:left}}
+</style>
+</head>
+<body>
+<canvas id="gl" tabindex="0"></canvas>
+<div id="laser" aria-hidden="true"><div class="ceil"></div><div class="floor"></div><div class="horizon"></div><div class="sweep"></div></div>
+<div id="vignette" aria-hidden="true"></div>
+<div id="scanlines" aria-hidden="true"></div>
+
+<!-- =============================== PANEL =============================== -->
+<section id="panel" class="panel">
+  <div class="card corner">
+    <div class="brand">
+      <b><i></i>Spatial Twin <span style="color:var(--muted)">/ RGB-D · v1.0</span></b>
+      <span id="backend-chip" class="chip"><span class="dot"></span><span id="backend-txt">conectando al backend…</span></span>
+    </div>
+
+    <!-- landing -->
+    <div id="view-landing">
+      <h1>De un video de tu móvil<br>a un <span>gemelo digital</span> explorable.</h1>
+      <p class="lead">Extraemos fotogramas clave, inferimos profundidad métrica con Depth Anything V2, desproyectamos cada píxel a 3D y generamos una malla texturizada real. Sin mocks: cada línea del log es una etapa ejecutándose.</p>
+      <div id="dropzone">
+        <div class="ico">⟦ ◈ ⟧</div>
+        <p>Arrastra aquí el video del salón o haz clic para elegirlo</p>
+        <small>MP4 · MOV · WEBM — 5 a 30 segundos, recorrido lento y con buena luz</small>
+        <input id="file" type="file" accept="video/*" />
+      </div>
+      <div class="opts">
+        <div class="opt">Keyframes
+          <div class="seg" id="seg-frames"><button data-v="2">2</button><button data-v="3">3</button><button data-v="4" class="on">4</button><button data-v="5">5</button></div>
+        </div>
+        <div class="opt">Densidad
+          <div class="seg" id="seg-step"><button data-v="2">Alta</button><button data-v="3" class="on">Media</button><button data-v="4">Rápida</button></div>
+        </div>
+        <span class="hint" id="hint-existing"></span>
+      </div>
+    </div>
+
+    <!-- progreso -->
+    <div id="view-progress" hidden>
+      <h1>Reconstruyendo <span>en tiempo real</span></h1>
+      <div class="stages">
+        <div class="stage" data-stage="frames">01 Frames<em>keyframes</em></div>
+        <div class="stage" data-stage="depth">02 Depth<em>métrica</em></div>
+        <div class="stage" data-stage="register">03 Registro<em>PnP</em></div>
+        <div class="stage" data-stage="mesh">04 Malla<em>RGB-D</em></div>
+        <div class="stage" data-stage="export">05 Export<em>GLB</em></div>
+      </div>
+      <div class="meter"><span>ETAPA <b id="m-stage">init</b></span><span>T+<b id="m-time">0.0</b>s</span><span><b id="m-pct">0</b>%</span></div>
+      <div class="bar"><i id="bar"></i></div>
+      <div id="console" role="log" aria-live="polite"></div>
+      <div id="error-box" class="error" hidden></div>
+      <div class="row" style="margin-top:14px"><span class="hint">La inferencia corre en el backend Python (torch). El primer escaneo carga el modelo (~10 s extra).</span><button id="btn-cancel" class="btn ghost" hidden>Volver</button></div>
+    </div>
+
+    <!-- listo -->
+    <div id="view-ready" hidden>
+      <h1>Gemelo digital <span>listo</span></h1>
+      <div class="stats">
+        <div class="stat"><small>Vértices</small><b id="s-verts">—</b></div>
+        <div class="stat"><small>Triángulos</small><b id="s-tris">—</b></div>
+        <div class="stat"><small>Dimensiones</small><b id="s-dims">—</b></div>
+        <div class="stat"><small>Tiempo total</small><b id="s-time">—</b></div>
+      </div>
+      <div class="strip" id="strip"></div>
+      <div class="row">
+        <button id="btn-enter" class="btn primary">◈ Entrar al gemelo</button>
+        <span class="hint">WASD moverse · Shift correr · ratón mirar · Esc salir</span>
+        <button id="btn-new" class="btn ghost">Nuevo escaneo</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- =============================== HUD =============================== -->
+<div id="hud" aria-hidden="true">
+  <div class="frame"></div><div class="frame2"></div>
+  <div class="hud-tl">
+    <div class="title"><i></i>Spatial Twin · Gemelo digital</div>
+    <div class="sub"><span>MODO <b id="h-mode">MALLA</b></span><span>FX <b id="h-fx">ON</b></span><span>LUZ <b id="h-light">OFF</b></span><span><b id="h-fps">0</b> FPS</span></div>
+  </div>
+  <div class="compass"><div class="ticks" id="ticks"></div><div class="needle"></div><div class="deg" id="h-deg">0°</div></div>
+  <div class="hud-tr">
+    <div class="tele">
+      <span>vértices</span><b id="t-verts">—</b>
+      <span>triángulos</span><b id="t-tris">—</b>
+      <span>densidad</span><b id="t-dens">—</b>
+      <span>sala</span><b id="t-dims">—</b>
+      <span>profundidad</span><b id="t-depth">—</b>
+      <span>keyframes</span><b id="t-kf">—</b>
+      <span>registro</span><b id="t-reg" class="amber">—</b>
+      <span>modelo</span><b id="t-model" class="green">—</b>
+      <span>posición</span><b id="t-pos">—</b>
+      <span>altura ojo</span><b id="t-eye">—</b>
+    </div>
+  </div>
+  <div class="cross"><i></i></div>
+  <div class="hud-bl">
+    <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> moverse &nbsp; <kbd>Shift</kbd> correr &nbsp; <kbd>Espacio</kbd> saltar</div>
+    <div><kbd>M</kbd> malla / puntos &nbsp; <kbd>L</kbd> linterna &nbsp; <kbd>P</kbd> post-FX &nbsp; <kbd>G</kbd> rejilla</div>
+    <div><kbd>N</kbd> vuelo libre &nbsp; <kbd>Q</kbd><kbd>E</kbd> subir / bajar &nbsp; <kbd>R</kbd> reiniciar &nbsp; <kbd>Esc</kbd> menú</div>
+  </div>
+  <div class="hud-br">
+    <div class="ministrip" id="ministrip"></div>
+    <div class="pip"><video id="pip" muted loop playsinline autoplay></video><div class="lab"><i></i>REALIDAD · CÁMARA</div><div class="lab2">GEMELO ▶</div></div>
+  </div>
+</div>
+<div id="paused" hidden><div class="box"><b>Haz clic para continuar</b><small>Esc para volver al panel</small></div></div>
+<div id="toast"></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<!-- JS:BEGIN -->
+<script type="module">
+console.info('[spatial-twin] motor pendiente de cargar');
+</script>
+<!-- JS:END -->
+</body>
+</html>
