@@ -20,3 +20,7 @@ backend/output/
 Thumbs.db
 .vscode/
 .idea/
+
+# Videos de prueba (pesados, no se versionan)
+*.mp4
+*.mov
