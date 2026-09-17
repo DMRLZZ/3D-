@@ -673,6 +673,7 @@ $('btn-enter').onclick = () => enterWorld();
 $('btn-new').onclick = () => { showView('landing'); };
 function enterWorld() {
   $('panel').classList.add('fade'); $('laser').classList.add('off'); $('hud').classList.add('on'); $('paused').hidden = true;
+  resetPlayer();                                    // la órbita idle movió la cámara: volvemos a la cámara 0
   app.entered = true; app.revealing = true; shared.uReveal.value = 0; revealStart = performance.now();
   controls.lock();
 }
@@ -715,7 +716,6 @@ function loop() {
     if (k >= 1) { app.revealing = false; shared.uReveal.value = 1e4; }
   } else if (app.model && !app.entered) shared.uReveal.value = 1e4;
   updatePlayer(dt);
-  if (app.model) helpers.rotation.y = 0;
   if (app.fx) { fxPass.uniforms.uTime.value = shared.uTime.value; composer.render(); } else renderer.render(scene, camera);
   fpsAcc += dt; fpsN++; hudT += dt;
   if (hudT > 0.2 && app.entered) {
