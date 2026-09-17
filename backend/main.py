@@ -58,7 +58,7 @@ DEFAULT_KEYFRAMES = int(os.getenv("MAX_KEYFRAMES", "4"))
 DEFAULT_MESH_STEP = int(os.getenv("MESH_STEP", "3"))                  # zancada en píxeles del grid de triángulos
 TEXTURE_MAX = int(os.getenv("TEXTURE_MAX", "960"))                    # lado mayor de la textura por keyframe
 MAX_DEPTH_M = float(os.getenv("MAX_DEPTH", "12.0"))                   # recorte de profundidad (metros)
-CANDIDATE_FRAMES = int(os.getenv("CANDIDATE_FRAMES", "36"))           # fotogramas candidatos a muestrear
+CANDIDATE_FRAMES = int(os.getenv("CANDIDATE_FRAMES", "24"))           # fotogramas candidatos a muestrear
 PORT = int(os.getenv("PORT", "8000"))
 
 MODEL_GLB = OUTPUT_DIR / "scene.glb"
@@ -68,6 +68,8 @@ VIDEO_COPY = OUTPUT_DIR / "source_video.mp4"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("spatial-twin")
+for _noisy in ("httpx", "huggingface_hub", "urllib3", "filelock"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 class PipelineError(RuntimeError):
@@ -377,7 +379,9 @@ def estimate_depths(keyframes: list) -> dict:
 # --------------------------------------------------------------------------------------
 def intrinsics_for(w: int, h: int) -> np.ndarray:
     """Matriz K estimada a partir del FOV horizontal del smartphone (píxeles cuadrados, centro óptico en el centro)."""
-    fx = 0.5 * w / math.tan(math.radians(CAMERA_HFOV_DEG) / 2.0)
+    # El FOV nominal del smartphone corresponde al lado LARGO del sensor: así funciona igual para
+    # videos horizontales (16:9) y verticales (9:16) sin deformar las proporciones métricas.
+    fx = 0.5 * max(w, h) / math.tan(math.radians(CAMERA_HFOV_DEG) / 2.0)
     return np.array([[fx, 0.0, w / 2.0], [0.0, fx, h / 2.0], [0.0, 0.0, 1.0]], dtype=np.float64)
 
 
@@ -420,8 +424,8 @@ def relative_pose_pnp(kf_a, kf_b, K: np.ndarray) -> Optional[dict]:
 
     success, rvec, tvec, inliers = cv2.solvePnPRansac(
         obj.reshape(-1, 1, 3), img.reshape(-1, 1, 2), K, None,
-        iterationsCount=1000, reprojectionError=4.0, confidence=0.999, flags=cv2.SOLVEPNP_EPNP)
-    if not success or inliers is None or len(inliers) < 15:
+        iterationsCount=2000, reprojectionError=6.0, confidence=0.999, flags=cv2.SOLVEPNP_EPNP)
+    if not success or inliers is None or len(inliers) < 12:
         return None
     inl = inliers.ravel()
     # refinamiento Levenberg-Marquardt sobre los inliers
