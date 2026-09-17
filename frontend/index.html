@@ -291,7 +291,456 @@ h1 span{color:var(--cyan)}
 </script>
 <!-- JS:BEGIN -->
 <script type="module">
-console.info('[spatial-twin] motor pendiente de cargar');
+/* ==========================================================================================
+   SPATIAL TWIN · motor de exploración (Three.js r170)
+   - Consume el GLB texturizado real del backend (+ metadata) y permite caminar en primera persona.
+   - Malla: MeshStandardMaterial con la textura fotográfica, luz dinámica, sombras y barrido láser.
+   - Puntos: shader propio que muestrea la misma textura con tamaño de partícula adaptativo.
+   - Colisión: rejilla de ocupación XZ construida a partir de los vértices (paredes/muebles) + suelo.
+   ========================================================================================== */
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// ------------------------------------------------------------------ configuración / utilidades
+const qs = new URLSearchParams(location.search);
+const API = qs.get('api') || (location.protocol === 'file:' ? 'http://localhost:8000' : '');
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => n.toLocaleString('es-ES');
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+let toastTimer = 0;
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 1500);
+}
+
+// ------------------------------------------------------------------ estado de la aplicación
+const app = {
+  view: 'landing', meta: null, model: null, videoURL: null, frames: 4, step: 3,
+  mode: 'mesh', fx: true, light: false, grid: true, fly: false, entered: false,
+  reveal: 0, revealTarget: 0, revealing: false, lastLogCount: 0, pollTimer: 0,
+};
+
+// ------------------------------------------------------------------ backend health
+(async function health() {
+  const chip = $('backend-chip'), txt = $('backend-txt');
+  try {
+    const h = await (await fetch(`${API}/api/health`)).json();
+    chip.classList.add(h.ok ? 'ok' : 'bad');
+    txt.textContent = `backend ${h.ok ? 'online' : 'sin torch'} · ${String(h.device).toUpperCase()} · ${h.model.split('/').pop().replace('-hf', '')}`;
+    const st = await (await fetch(`${API}/api/status`)).json();
+    if (st.model_ready && st.state !== 'running') {
+      $('hint-existing').innerHTML = `Hay un gemelo previo listo · <u style="cursor:pointer;color:var(--cyan)" id="use-existing">usar sin re-procesar</u>`;
+      $('use-existing').onclick = () => loadResult();
+    } else if (st.state === 'running') { showProgress(); startPolling(); }
+  } catch (e) {
+    chip.classList.add('bad'); txt.textContent = `backend no accesible en ${API || location.origin}`;
+  }
+})();
+
+// ------------------------------------------------------------------ opciones (segmentos)
+for (const [segId, key] of [['seg-frames', 'frames'], ['seg-step', 'step']]) {
+  $(segId).querySelectorAll('button').forEach((b) => b.onclick = () => {
+    $(segId).querySelectorAll('button').forEach((x) => x.classList.remove('on'));
+    b.classList.add('on'); app[key] = +b.dataset.v;
+  });
+}
+
+// ------------------------------------------------------------------ subida de video
+const drop = $('dropzone'), fileInput = $('file');
+['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', (e) => { const f = e.dataTransfer.files?.[0]; if (f) startScan(f); });
+fileInput.addEventListener('change', () => { const f = fileInput.files?.[0]; if (f) startScan(f); fileInput.value = ''; });
+
+function showView(name) {
+  for (const v of ['landing', 'progress', 'ready']) $(`view-${v}`).hidden = v !== name;
+  app.view = name;
+}
+function showProgress() { showView('progress'); $('console').innerHTML = ''; app.lastLogCount = 0; $('error-box').hidden = true; $('btn-cancel').hidden = true; }
+
+async function startScan(file) {
+  if (!file.type.startsWith('video/') && !/\.(mp4|mov|webm|mkv|avi|m4v)$/i.test(file.name)) { toast('Ese archivo no es un video'); return; }
+  if (app.videoURL) URL.revokeObjectURL(app.videoURL);
+  app.videoURL = URL.createObjectURL(file);
+  showProgress();
+  logLine({ t: 0, stage: 'upload', msg: `Subiendo ${file.name} (${(file.size / 1e6).toFixed(1)} MB) al backend...` });
+  const fd = new FormData(); fd.append('file', file, file.name);
+  try {
+    const r = await fetch(`${API}/api/scan?frames=${app.frames}&step=${app.step}`, { method: 'POST', body: fd });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.detail || `HTTP ${r.status}`); }
+    startPolling();
+  } catch (e) { showError(`No se pudo iniciar el escaneo: ${e.message}`); }
+}
+
+function showError(msg) { $('error-box').textContent = msg; $('error-box').hidden = false; $('btn-cancel').hidden = false; }
+$('btn-cancel').onclick = () => showView('landing');
+
+// ------------------------------------------------------------------ polling de progreso REAL
+const STAGE_ORDER = ['frames', 'depth', 'register', 'mesh', 'export'];
+function logLine(l, err = false) {
+  const c = $('console');
+  const div = document.createElement('div'); div.className = 'l' + (err ? ' err' : '');
+  div.innerHTML = `<span class="t">${(+l.t).toFixed(2)}s</span><span class="s">${l.stage}</span><span class="m"></span>`;
+  div.querySelector('.m').textContent = l.msg;
+  c.appendChild(div); c.scrollTop = c.scrollHeight;
+}
+function startPolling() {
+  clearInterval(app.pollTimer);
+  app.pollTimer = setInterval(async () => {
+    try {
+      const s = await (await fetch(`${API}/api/status`)).json();
+      $('m-stage').textContent = s.stage || '—'; $('m-time').textContent = (+s.elapsed).toFixed(1);
+      $('m-pct').textContent = Math.round(s.progress * 100); $('bar').style.width = `${s.progress * 100}%`;
+      const idx = STAGE_ORDER.indexOf(s.stage);
+      document.querySelectorAll('.stage').forEach((el) => {
+        const i = STAGE_ORDER.indexOf(el.dataset.stage);
+        el.classList.toggle('active', i === idx && s.state === 'running');
+        el.classList.toggle('done', s.state === 'done' || (idx >= 0 && i < idx));
+      });
+      for (let i = app.lastLogCount; i < s.log.length; i++) logLine(s.log[i], s.log[i].stage === 'error');
+      app.lastLogCount = s.log.length;
+      if (s.state === 'done') { clearInterval(app.pollTimer); await loadResult(); }
+      if (s.state === 'error') { clearInterval(app.pollTimer); showError(s.error || 'El pipeline falló.'); }
+    } catch (e) { /* red intermitente: reintenta en el siguiente tick */ }
+  }, 400);
+}
+
+// ------------------------------------------------------------------ carga del resultado (GLB + metadata)
+const loader = new GLTFLoader();
+async function loadResult() {
+  showProgress();
+  logLine({ t: 0, stage: 'client', msg: 'Descargando metadata y modelo GLB texturizado...' });
+  try {
+    const meta = await (await fetch(`${API}/api/metadata?t=${Date.now()}`)).json();
+    app.meta = meta;
+    const gltf = await new Promise((res, rej) => loader.load(`${API}/api/model?format=glb&t=${Date.now()}`, res,
+      (ev) => { if (ev.total) $('bar').style.width = `${(ev.loaded / ev.total) * 100}%`; }, rej));
+    installModel(gltf.scene, meta);
+    fillReady(meta);
+    showView('ready');
+  } catch (e) { console.error(e); showError(`Error cargando el modelo: ${e.message || e}`); }
+}
+
+function fillReady(meta) {
+  const g = meta.geometry;
+  $('s-verts').textContent = fmt(g.vertices); $('s-tris').textContent = fmt(g.triangles);
+  $('s-dims').innerHTML = `${g.dimensions_m.width}×${g.dimensions_m.depth}<u>m</u>`;
+  $('s-time').innerHTML = `${meta.timings.total_s}<u>s</u>`;
+  const strip = $('strip'), mini = $('ministrip'); strip.innerHTML = ''; mini.innerHTML = '';
+  for (const p of meta.previews) {
+    const tile = (small) => `<div class="tile"><img src="${API}${p.frame}?t=${Date.now()}" alt=""><img class="d" src="${API}${p.depth}?t=${Date.now()}" alt="">${small ? '' : `<span>KF ${p.index + 1} · t=${p.time_s}s · ${p.depth_range_m[0]}–${p.depth_range_m[1]} m</span>`}</div>`;
+    strip.insertAdjacentHTML('beforeend', tile(false)); mini.insertAdjacentHTML('beforeend', tile(true));
+  }
+  const pip = $('pip'); pip.src = app.videoURL || `${API}/api/video?t=${Date.now()}`; pip.play().catch(() => {});
+  // telemetría estática del HUD
+  $('t-verts').textContent = fmt(g.vertices); $('t-tris').textContent = fmt(g.triangles);
+  $('t-dens').textContent = `${fmt(Math.round(g.point_density_per_m2))} pts/m²`;
+  $('t-dims').textContent = `${g.dimensions_m.width} × ${g.dimensions_m.height} × ${g.dimensions_m.depth} m`;
+  const dr = meta.previews.map((p) => p.depth_range_m); $('t-depth').textContent = `${Math.min(...dr.map((d) => d[0])).toFixed(2)} – ${Math.max(...dr.map((d) => d[1])).toFixed(2)} m`;
+  $('t-kf').textContent = `${meta.video.selected.length} / ${meta.video.total_frames} frames · ${meta.video.source_resolution.join('×')}`;
+  const pnp = meta.registration.filter((r) => r.method === 'pnp_ransac');
+  $('t-reg').textContent = pnp.length ? `PnP ${pnp.length}/${meta.registration.length - 1} · ${pnp.reduce((a, r) => a + r.inliers, 0)} inliers` : 'abanico (sin solape)';
+  $('t-model').textContent = `${meta.depth.model.split('/').pop().replace('-hf', '')} · ${meta.depth.device.toUpperCase()} · ${meta.depth.inference_s.reduce((a, b) => a + b, 0).toFixed(1)}s`;
+  $('t-eye').textContent = `${g.eye_height_m.toFixed(2)} m`;
+}
+
+// ------------------------------------------------------------------ escena Three.js
+const canvas = $('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.05;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x05070a);
+scene.fog = new THREE.FogExp2(0x05070a, 0.035);
+const camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.03, 200);
+camera.position.set(0, 0, 0);
+
+scene.add(new THREE.HemisphereLight(0xdfe7ee, 0x1a2230, 1.1));
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+const flashlight = new THREE.SpotLight(0xfff4e0, 0, 18, THREE.MathUtils.degToRad(28), 0.55, 1.4);
+flashlight.castShadow = true; flashlight.shadow.mapSize.set(1024, 1024); flashlight.shadow.bias = -0.0008; flashlight.shadow.normalBias = 0.02;
+flashlight.position.set(0.32, -0.22, 0.1); flashlight.target.position.set(0, -0.05, -3);
+camera.add(flashlight); camera.add(flashlight.target); scene.add(camera);
+
+const world = new THREE.Group(); scene.add(world);            // modelo (malla + puntos)
+const helpers = new THREE.Group(); scene.add(helpers);        // rejilla, frustums, marcadores
+
+// uniforms compartidos entre malla y puntos
+const shared = { uReveal: { value: 0 }, uTime: { value: 0 }, uPointScale: { value: 1.7 }, uPixelFactor: { value: 1 } };
+
+function patchMeshMaterial(mat) {
+  mat.side = THREE.DoubleSide; mat.roughness = 0.95; mat.metalness = 0; mat.envMapIntensity = 0;
+  if (mat.map) { mat.emissive = new THREE.Color(0xffffff); mat.emissiveMap = mat.map; mat.emissiveIntensity = 0.62; mat.map.anisotropy = renderer.capabilities.getMaxAnisotropy(); }
+  mat.onBeforeCompile = (sh) => {
+    sh.uniforms.uReveal = shared.uReveal; sh.uniforms.uTime = shared.uTime;
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vWPos;')
+      .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\nvWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform float uReveal; uniform float uTime; varying vec3 vWPos;')
+      .replace('#include <dithering_fragment>', `#include <dithering_fragment>
+        float dR = length(vWPos - cameraPosition);
+        if (dR > uReveal) discard;
+        float edge = 1.0 - smoothstep(0.0, 0.45, uReveal - dR);           // frente de onda láser
+        float scan = 0.5 + 0.5 * sin(vWPos.y * 90.0 - uTime * 6.0);
+        float near = 1.0 - smoothstep(0.0, 2.5, uReveal - dR);             // scanlines solo tras el frente
+        gl_FragColor.rgb += vec3(0.22, 0.94, 1.0) * (edge * 1.6 + scan * near * 0.08);`);
+  };
+  mat.needsUpdate = true;
+}
+
+const pointsVert = /* glsl */`
+  attribute float aSize; uniform float uPointScale; uniform float uPixelFactor;
+  varying vec2 vUv; varying vec3 vWPos;
+  void main(){ vUv = uv; vWPos = (modelMatrix * vec4(position,1.0)).xyz;
+    vec4 mv = modelViewMatrix * vec4(position,1.0); gl_Position = projectionMatrix * mv;
+    gl_PointSize = clamp(aSize * uPointScale * uPixelFactor / max(-mv.z, 0.05), 1.5, 48.0); }`;
+const pointsFrag = /* glsl */`
+  uniform sampler2D map; uniform float uReveal; uniform float uTime; varying vec2 vUv; varying vec3 vWPos;
+  void main(){ vec2 c = gl_PointCoord - 0.5; if (dot(c,c) > 0.25) discard;
+    float dR = length(vWPos - cameraPosition); if (dR > uReveal) discard;
+    vec3 col = texture2D(map, vUv).rgb;
+    float edge = 1.0 - smoothstep(0.0, 0.45, uReveal - dR);
+    col += vec3(0.22,0.94,1.0) * edge * 1.4;
+    gl_FragColor = vec4(col, 1.0);
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment> }`;
+
+function makePointSizes(geom) {
+  // espaciado local: distancia al vecino en el orden row-major que produce el backend
+  const p = geom.attributes.position.array, n = p.length / 3, out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let best = 1e9;
+    for (const j of [i - 1, i + 1]) {
+      if (j < 0 || j >= n) continue;
+      const dx = p[3 * i] - p[3 * j], dy = p[3 * i + 1] - p[3 * j + 1], dz = p[3 * i + 2] - p[3 * j + 2];
+      best = Math.min(best, Math.hypot(dx, dy, dz));
+    }
+    out[i] = clamp(best === 1e9 ? 0.02 : best, 0.004, 0.25);
+  }
+  geom.setAttribute('aSize', new THREE.BufferAttribute(out, 1));
+}
+
+const collision = { cell: 0.22, cells: new Set(), floorY: -1.5, eye: 1.6, minX: 0, minZ: 0 };
+function keyOf(x, z) { return `${Math.floor(x / collision.cell)}|${Math.floor(z / collision.cell)}`; }
+
+function installModel(root, meta) {
+  world.clear(); helpers.clear();
+  app.model = root; world.add(root);
+  const g = meta.geometry;
+  collision.floorY = g.floor_y; collision.eye = g.eye_height_m; collision.cells.clear();
+  root.updateMatrixWorld(true);
+  const tmp = new THREE.Vector3();
+  let bboxDiag = new THREE.Box3().setFromObject(root).getSize(new THREE.Vector3()).length();
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+    o.geometry.computeVertexNormals();
+    o.castShadow = true; o.receiveShadow = true;
+    patchMeshMaterial(o.material);
+    makePointSizes(o.geometry);
+    const pm = new THREE.ShaderMaterial({ uniforms: { map: { value: o.material.map }, ...shared }, vertexShader: pointsVert, fragmentShader: pointsFrag, transparent: false });
+    const pts = new THREE.Points(o.geometry, pm); pts.name = 'points'; pts.visible = app.mode === 'points'; pts.frustumCulled = false;
+    o.add(pts); o.userData.points = pts; o.frustumCulled = false;
+    // rejilla de ocupación: vértices a altura de torso = obstáculo
+    const pos = o.geometry.attributes.position, m = o.matrixWorld;
+    const lo = collision.floorY + 0.3, hi = collision.floorY + 1.9;
+    for (let i = 0; i < pos.count; i += 2) {
+      tmp.fromBufferAttribute(pos, i).applyMatrix4(m);
+      if (tmp.y > lo && tmp.y < hi) collision.cells.add(keyOf(tmp.x, tmp.z));
+    }
+  });
+  // suelo láser + frustums de las cámaras del recorrido
+  const size = Math.ceil(Math.max(g.dimensions_m.width, g.dimensions_m.depth) * 1.6 + 6);
+  const grid = new THREE.GridHelper(size, size * 2, 0x38f0ff, 0x1a3a44);
+  grid.material.transparent = true; grid.material.opacity = 0.35; grid.position.set((g.bbox_min[0] + g.bbox_max[0]) / 2, g.floor_y + 0.01, (g.bbox_min[2] + g.bbox_max[2]) / 2);
+  grid.name = 'grid'; helpers.add(grid);
+  const frCol = new THREE.LineBasicMaterial({ color: 0xffb547, transparent: true, opacity: 0.85 });
+  for (const c of g.cameras) {
+    const fr = new THREE.LineSegments(frustumGeometry(0.28, 0.16, 0.22), frCol);
+    fr.position.fromArray(c.position);
+    const fwd = new THREE.Vector3().fromArray(c.forward).normalize();
+    fr.lookAt(fr.position.clone().add(fwd)); helpers.add(fr);
+  }
+  shared.uReveal.value = 0; app.revealTarget = bboxDiag + 4; app.entered = false;
+  resetPlayer();
+}
+function frustumGeometry(d, w, h) {
+  const p = [[0, 0, 0], [-w, h, -d], [w, h, -d], [w, -h, -d], [-w, -h, -d]];
+  const idx = [[0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [2, 3], [3, 4], [4, 1]];
+  const arr = []; for (const [a, b] of idx) arr.push(...p[a], ...p[b]);
+  return new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
+}
+
+// ------------------------------------------------------------------ post-procesado
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.32, 0.55, 0.82);
+composer.addPass(bloom);
+const fxPass = new ShaderPass({
+  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uAberration: { value: 0.0016 } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+  fragmentShader: `uniform sampler2D tDiffuse; uniform float uTime; uniform float uAberration; varying vec2 vUv;
+    void main(){ vec2 d = (vUv - 0.5); float r2 = dot(d,d);
+      vec2 off = d * uAberration * (1.0 + r2 * 6.0);
+      vec3 col = vec3(texture2D(tDiffuse, vUv + off).r, texture2D(tDiffuse, vUv).g, texture2D(tDiffuse, vUv - off).b);
+      col *= 1.0 - smoothstep(0.35, 0.95, r2 * 2.2) * 0.35;                       // viñeta
+      col += (fract(sin(dot(vUv * 1000.0 + uTime, vec2(12.9898,78.233))) * 43758.5453) - 0.5) * 0.02; // grano
+      gl_FragColor = vec4(col, 1.0); }`,
+});
+composer.addPass(fxPass);
+composer.addPass(new OutputPass());
+
+// ------------------------------------------------------------------ controlador primera persona
+const controls = new PointerLockControls(camera, document.body);
+const keys = new Set();
+const vel = new THREE.Vector3(); let vy = 0, onGround = true;
+const fwdV = new THREE.Vector3(), rightV = new THREE.Vector3(), wish = new THREE.Vector3();
+
+document.addEventListener('keydown', (e) => {
+  if (e.repeat) return; keys.add(e.code);
+  if (!app.entered) return;
+  switch (e.code) {
+    case 'KeyM': setMode(app.mode === 'mesh' ? 'points' : 'mesh'); break;
+    case 'KeyP': app.fx = !app.fx; $('h-fx').textContent = app.fx ? 'ON' : 'OFF'; toast(`Post-FX ${app.fx ? 'activado' : 'desactivado'}`); break;
+    case 'KeyL': app.light = !app.light; flashlight.intensity = app.light ? 90 : 0; $('h-light').textContent = app.light ? 'ON' : 'OFF'; toast(`Linterna ${app.light ? 'encendida' : 'apagada'}`); break;
+    case 'KeyG': app.grid = !app.grid; helpers.getObjectByName('grid').visible = app.grid; toast(`Rejilla ${app.grid ? 'visible' : 'oculta'}`); break;
+    case 'KeyN': app.fly = !app.fly; vy = 0; toast(app.fly ? 'Vuelo libre · colisiones desactivadas' : 'Modo caminar'); break;
+    case 'KeyR': resetPlayer(); toast('Posición reiniciada en la cámara 0'); break;
+    case 'Space': if (onGround && !app.fly) { vy = 3.6; onGround = false; } break;
+  }
+});
+document.addEventListener('keyup', (e) => keys.delete(e.code));
+window.addEventListener('blur', () => keys.clear());
+
+function setMode(mode) {
+  app.mode = mode; $('h-mode').textContent = mode === 'mesh' ? 'MALLA' : 'PUNTOS';
+  world.traverse((o) => { if (o.isMesh) { o.material.visible = mode === 'mesh'; o.userData.points.visible = mode === 'points'; } });
+  toast(mode === 'mesh' ? 'Malla texturizada' : 'Nube de puntos RGB');
+}
+function resetPlayer() {
+  const c = app.meta?.geometry?.cameras?.[0];
+  camera.position.set(c ? c.position[0] : 0, collision.floorY + collision.eye, c ? c.position[2] : 0);
+  camera.rotation.set(0, 0, 0); vel.set(0, 0, 0); vy = 0; onGround = true;
+  if (c) { const f = new THREE.Vector3().fromArray(c.forward); f.y = 0; if (f.lengthSq() > 1e-6) camera.lookAt(camera.position.clone().add(f)); }
+}
+function blocked(x, z) {
+  if (app.fly) return false;
+  const r = 0.28;
+  for (const [dx, dz] of [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r]]) if (collision.cells.has(keyOf(x + dx, z + dz))) return true;
+  return false;
+}
+function updatePlayer(dt) {
+  if (!controls.isLocked) return;
+  camera.getWorldDirection(fwdV); fwdV.y = 0; fwdV.normalize();
+  rightV.crossVectors(fwdV, camera.up).normalize();
+  wish.set(0, 0, 0);
+  if (keys.has('KeyW') || keys.has('ArrowUp')) wish.add(fwdV);
+  if (keys.has('KeyS') || keys.has('ArrowDown')) wish.sub(fwdV);
+  if (keys.has('KeyD') || keys.has('ArrowRight')) wish.add(rightV);
+  if (keys.has('KeyA') || keys.has('ArrowLeft')) wish.sub(rightV);
+  const run = keys.has('ShiftLeft') || keys.has('ShiftRight');
+  const speed = (run ? 4.6 : 2.1) * (app.fly ? 1.6 : 1);
+  if (wish.lengthSq() > 0) wish.normalize().multiplyScalar(speed);
+  vel.lerp(wish, 1 - Math.exp(-dt * 10));                       // aceleración suave
+  const p = camera.position;
+  const nx = p.x + vel.x * dt, nz = p.z + vel.z * dt;
+  if (!blocked(nx, nz)) { p.x = nx; p.z = nz; }
+  else if (!blocked(nx, p.z)) { p.x = nx; vel.z = 0; }          // deslizamiento por la pared
+  else if (!blocked(p.x, nz)) { p.z = nz; vel.x = 0; }
+  else { vel.set(0, 0, 0); }
+  if (app.fly) {
+    const up = (keys.has('KeyE') || keys.has('Space') ? 1 : 0) - (keys.has('KeyQ') || keys.has('ControlLeft') ? 1 : 0);
+    p.y += up * speed * 0.7 * dt;
+  } else {
+    vy -= 9.81 * dt; p.y += vy * dt;
+    const floor = collision.floorY + collision.eye;
+    if (p.y <= floor) { p.y = floor; vy = 0; onGround = true; }
+  }
+}
+
+// ------------------------------------------------------------------ entrar / salir
+$('btn-enter').onclick = () => enterWorld();
+$('btn-new').onclick = () => { showView('landing'); };
+function enterWorld() {
+  $('panel').classList.add('fade'); $('laser').classList.add('off'); $('hud').classList.add('on'); $('paused').hidden = true;
+  app.entered = true; app.revealing = true; shared.uReveal.value = 0; revealStart = performance.now();
+  controls.lock();
+}
+let revealStart = 0;
+controls.addEventListener('unlock', () => { if (app.entered) $('paused').hidden = false; });
+controls.addEventListener('lock', () => { $('paused').hidden = true; });
+$('paused').addEventListener('click', () => controls.lock());
+document.addEventListener('mousedown', () => { if (app.entered && !controls.isLocked && !$('paused').hidden) controls.lock(); });
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Escape' && app.entered && !controls.isLocked) {   // segundo Esc: volver al panel
+    app.entered = false; $('hud').classList.remove('on'); $('paused').hidden = true; $('laser').classList.remove('off');
+    $('panel').classList.remove('fade'); showView('ready');
+  }
+});
+
+// ------------------------------------------------------------------ brújula
+(function buildCompass() {
+  const names = { 0: 'N', 90: 'E', 180: 'S', 270: 'O' }; const t = $('ticks'); let html = '';
+  for (let rep = 0; rep < 3; rep++) for (let d = 0; d < 360; d += 15) html += `<div class="tk ${names[d] ? 'card' : ''}">${names[d] ?? (d % 45 === 0 ? d : '·')}</div>`;
+  t.innerHTML = html;
+})();
+function updateCompass() {
+  const dir = camera.getWorldDirection(fwdV);
+  let deg = (Math.atan2(dir.x, -dir.z) * 180 / Math.PI + 360) % 360;   // 0° = -Z (norte de la escena)
+  const px = 40 / 15;                                                  // 40 px por cada 15°
+  $('ticks').style.transform = `translateX(${160 - (deg + 360) * px}px)`;
+  $('h-deg').textContent = `${Math.round(deg)}°`;
+}
+
+// ------------------------------------------------------------------ bucle
+const clock = new THREE.Clock(); let fpsAcc = 0, fpsN = 0, hudT = 0;
+function loop() {
+  requestAnimationFrame(loop);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  shared.uTime.value += dt;
+  shared.uPixelFactor.value = (innerHeight * renderer.getPixelRatio()) / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2));
+  if (app.revealing) {
+    const k = clamp((performance.now() - revealStart) / 3200, 0, 1);
+    shared.uReveal.value = 0.05 + app.revealTarget * (1 - Math.pow(1 - k, 3));
+    if (k >= 1) { app.revealing = false; shared.uReveal.value = 1e4; }
+  } else if (app.model && !app.entered) shared.uReveal.value = 1e4;
+  updatePlayer(dt);
+  if (app.model) helpers.rotation.y = 0;
+  if (app.fx) { fxPass.uniforms.uTime.value = shared.uTime.value; composer.render(); } else renderer.render(scene, camera);
+  fpsAcc += dt; fpsN++; hudT += dt;
+  if (hudT > 0.2 && app.entered) {
+    hudT = 0; $('h-fps').textContent = Math.round(fpsN / fpsAcc); fpsAcc = 0; fpsN = 0;
+    const p = camera.position; $('t-pos').textContent = `${p.x.toFixed(2)}, ${(p.y - collision.floorY).toFixed(2)}, ${p.z.toFixed(2)} m`;
+    updateCompass();
+  }
+}
+loop();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight); bloom.setSize(innerWidth, innerHeight);
+});
+
+// idle: la cámara orbita lentamente el modelo mientras el panel está visible (fondo vivo tras el cristal)
+(function idleOrbit() {
+  let t = 0; const v = new THREE.Vector3();
+  (function tick() {
+    requestAnimationFrame(tick); if (!app.model || app.entered) return;
+    t += 0.004; const c = app.meta.geometry; const cx = (c.bbox_min[0] + c.bbox_max[0]) / 2, cz = (c.bbox_min[2] + c.bbox_max[2]) / 2;
+    camera.position.set(cx + Math.sin(t) * 1.2, c.floor_y + c.eye_height_m + 0.2, cz + Math.cos(t) * 1.2 + 1.5);
+    camera.lookAt(v.set(cx, c.floor_y + c.eye_height_m * 0.8, cz - 1.5));
+  })();
+})();
 </script>
 <!-- JS:END -->
 </body>
