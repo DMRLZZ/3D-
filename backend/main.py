@@ -463,3 +463,214 @@ def register_keyframes(keyframes: list, K: np.ndarray) -> tuple[list, list]:
                      0.5 + 0.08 * i / len(keyframes))
         poses.append(pose)
     return poses, stats
+
+
+# --------------------------------------------------------------------------------------
+# 4. Desproyección RGB-D → malla texturizada por keyframe
+# --------------------------------------------------------------------------------------
+@dataclass
+class FrameMesh:
+    vertices_cam: np.ndarray   # (N,3) coordenadas cámara OpenCV, metros
+    faces: np.ndarray          # (M,3) int32
+    uv: np.ndarray             # (N,2) convención OpenGL (origen abajo-izquierda)
+    colors: np.ndarray         # (N,3) uint8 RGB
+    texture: Image.Image       # textura JPEG del keyframe
+
+
+def build_frame_mesh(rgb: np.ndarray, depth: np.ndarray, K: np.ndarray, step: int) -> Optional[FrameMesh]:
+    """
+    Convierte un par RGB-D en una malla: cada píxel (con zancada `step`) es un vértice
+    desproyectado con la pinhole; los vecinos del grid forman dos triángulos por celda.
+    Se descartan las celdas que cruzan una discontinuidad de profundidad (bordes de objetos),
+    para no "estirar" goma entre primer plano y fondo.
+    """
+    H, W = depth.shape
+    vs = np.arange(0, H, step)
+    us = np.arange(0, W, step)
+    uu, vv = np.meshgrid(us, vs)                                  # (h, w)
+    Z = depth[vv, uu].astype(np.float64)
+    valid = np.isfinite(Z) & (Z > 0.05) & (Z < MAX_DEPTH_M)
+    if valid.sum() < 16:
+        return None
+
+    P = unproject(uu.astype(np.float64), vv.astype(np.float64), Z, K).reshape(-1, 3)
+    uv = np.stack([uu / max(W - 1, 1), 1.0 - vv / max(H - 1, 1)], axis=-1).reshape(-1, 2)
+    colors = rgb[vv, uu].reshape(-1, 3)
+
+    h, w = Z.shape
+    idx = np.arange(h * w).reshape(h, w)
+    a, b, c, d = idx[:-1, :-1], idx[:-1, 1:], idx[1:, :-1], idx[1:, 1:]
+    za, zb, zc, zd = Z[:-1, :-1], Z[:-1, 1:], Z[1:, :-1], Z[1:, 1:]
+    cell_valid = valid[:-1, :-1] & valid[:-1, 1:] & valid[1:, :-1] & valid[1:, 1:]
+    zmin = np.minimum(np.minimum(za, zb), np.minimum(zc, zd))
+    zmax = np.maximum(np.maximum(za, zb), np.maximum(zc, zd))
+    jump_tol = np.maximum(0.06, 0.08 * zmin)                      # 8 % de la profundidad (mín. 6 cm)
+    ok = cell_valid & ((zmax - zmin) < jump_tol)
+    if ok.sum() < 8:
+        return None
+    # dos triángulos por celda, orientados CCW vistos desde la cámara (tras la conversión a OpenGL)
+    tri1 = np.stack([a[ok], c[ok], b[ok]], axis=-1)
+    tri2 = np.stack([b[ok], c[ok], d[ok]], axis=-1)
+    faces = np.concatenate([tri1, tri2], axis=0).astype(np.int64)
+
+    # compactar: conservar solo vértices válidos (mantiene el orden row-major para el frontend)
+    keep = valid.reshape(-1)
+    remap = -np.ones(h * w, dtype=np.int64)
+    remap[keep] = np.arange(int(keep.sum()))
+    faces = remap[faces]
+    faces = faces[(faces >= 0).all(axis=1)].astype(np.int32)
+
+    buf = io.BytesIO()
+    Image.fromarray(rgb).save(buf, format="JPEG", quality=88)
+    buf.seek(0)
+    texture = Image.open(buf)
+    texture.load()
+    return FrameMesh(vertices_cam=P[keep].astype(np.float32), faces=faces, uv=uv[keep].astype(np.float32),
+                     colors=colors[keep].astype(np.uint8), texture=texture)
+
+
+# --------------------------------------------------------------------------------------
+# 5. Fusión, exportación (GLB + PLY) y metadata
+# --------------------------------------------------------------------------------------
+CV_TO_GL = np.diag([1.0, -1.0, -1.0])   # OpenCV (Y abajo, Z delante) → OpenGL/three.js (Y arriba, Z hacia el espectador)
+
+
+def export_scene(frame_meshes: list, poses: list, keyframes: list, K: np.ndarray, step: int) -> dict:
+    import trimesh
+
+    scene = trimesh.Scene()
+    all_pts, all_cols = [], []
+    total_v, total_f = 0, 0
+    for i, (fm, pose) in enumerate(zip(frame_meshes, poses)):
+        if fm is None:
+            continue
+        Vw = (pose[:3, :3] @ fm.vertices_cam.T).T + pose[:3, 3]          # cámara_i → mundo (OpenCV)
+        Vgl = (Vw @ CV_TO_GL.T).astype(np.float32)                        # → OpenGL
+        mesh = trimesh.Trimesh(vertices=Vgl, faces=fm.faces, process=False)
+        mesh.visual = trimesh.visual.TextureVisuals(uv=fm.uv, image=fm.texture)
+        scene.add_geometry(mesh, node_name=f"keyframe_{i}", geom_name=f"keyframe_{i}")
+        all_pts.append(Vgl)
+        all_cols.append(fm.colors)
+        total_v += len(Vgl)
+        total_f += len(fm.faces)
+        JOB.push("mesh", f"Keyframe {i}: {len(Vgl):,} vértices · {len(fm.faces):,} triángulos", 0.62 + 0.1 * (i + 1) / len(frame_meshes))
+
+    if total_v == 0:
+        raise PipelineError("La reconstrucción no produjo geometría válida (¿video demasiado oscuro o uniforme?).")
+
+    pts = np.concatenate(all_pts)
+    cols = np.concatenate(all_cols)
+    JOB.push("export", f"Exportando GLB texturizado ({total_v:,} vértices, {total_f:,} triángulos)...", 0.76)
+    glb_bytes = scene.export(file_type="glb")
+    MODEL_GLB.write_bytes(glb_bytes)
+    JOB.push("export", f"GLB escrito: {len(glb_bytes) / 1e6:.1f} MB", 0.86)
+
+    JOB.push("export", "Exportando nube de puntos PLY con color real...", 0.88)
+    cloud = trimesh.PointCloud(vertices=pts, colors=np.concatenate([cols, np.full((len(cols), 1), 255, np.uint8)], axis=1))
+    MODEL_PLY.write_bytes(cloud.export(file_type="ply"))
+
+    # --- métricas espaciales reales ---
+    bb_min, bb_max = pts.min(axis=0), pts.max(axis=0)
+    dims = (bb_max - bb_min)
+    floor_y = float(np.percentile(pts[:, 1], 2.0))
+    ceil_y = float(np.percentile(pts[:, 1], 98.0))
+    footprint = float(max(dims[0] * dims[2], 1e-6))
+    cams = []
+    for i, pose in enumerate(poses):
+        pos = (CV_TO_GL @ pose[:3, 3]).tolist()
+        fwd = (CV_TO_GL @ (pose[:3, :3] @ np.array([0.0, 0.0, 1.0]))).tolist()
+        cams.append({"index": i, "position": [round(x, 4) for x in pos], "forward": [round(x, 4) for x in fwd]})
+
+    return {
+        "vertices": int(total_v), "triangles": int(total_f), "keyframes_meshed": int(sum(fm is not None for fm in frame_meshes)),
+        "glb_bytes": len(glb_bytes), "ply_bytes": MODEL_PLY.stat().st_size,
+        "bbox_min": [round(float(x), 3) for x in bb_min], "bbox_max": [round(float(x), 3) for x in bb_max],
+        "dimensions_m": {"width": round(float(dims[0]), 2), "height": round(float(dims[1]), 2), "depth": round(float(dims[2]), 2)},
+        "floor_y": round(floor_y, 3), "ceiling_y": round(ceil_y, 3),
+        "eye_height_m": round(float(min(max(0.0 - floor_y, 0.9), 2.2)), 3),
+        "point_density_per_m2": round(total_v / footprint, 1),
+        "mesh_step_px": step, "intrinsics": {"fx": round(float(K[0, 0]), 2), "fy": round(float(K[1, 1]), 2),
+                                             "cx": round(float(K[0, 2]), 2), "cy": round(float(K[1, 2]), 2),
+                                             "hfov_deg": CAMERA_HFOV_DEG},
+        "cameras": cams,
+    }
+
+
+def save_previews(keyframes: list) -> list:
+    """Guarda miniaturas RGB y mapas de profundidad coloreados (evidencia visual del pipeline)."""
+    for old in PREVIEW_DIR.glob("*"):
+        old.unlink(missing_ok=True)
+    out = []
+    for i, kf in enumerate(keyframes):
+        rgb_small = _resize_max(kf.rgb, 480)
+        cv2.imwrite(str(PREVIEW_DIR / f"frame_{i}.jpg"), cv2.cvtColor(rgb_small, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 82])
+        d = kf.depth
+        valid = d[d > 0.05]
+        lo, hi = (float(np.percentile(valid, 1)), float(np.percentile(valid, 99))) if valid.size else (0.0, 1.0)
+        norm = np.clip((d - lo) / max(hi - lo, 1e-6), 0, 1)
+        colored = cv2.applyColorMap((255 - norm * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)   # cerca = claro
+        cv2.imwrite(str(PREVIEW_DIR / f"depth_{i}.jpg"), _resize_max(colored, 480), [cv2.IMWRITE_JPEG_QUALITY, 82])
+        out.append({"index": i, "frame": f"/api/preview/frame/{i}", "depth": f"/api/preview/depth/{i}",
+                    "depth_range_m": [round(lo, 2), round(hi, 2)], "video_frame": kf.index, "time_s": round(kf.time_s, 2)})
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# Orquestación del pipeline
+# --------------------------------------------------------------------------------------
+def run_pipeline(video_path: Path, n_keyframes: int, step: int) -> dict:
+    t_start = time.time()
+    timings: dict = {}
+
+    t0 = time.time()
+    keyframes, video_info = extract_keyframes(video_path, n_keyframes)
+    timings["keyframes_s"] = round(time.time() - t0, 2)
+
+    t0 = time.time()
+    depth_info = estimate_depths(keyframes)
+    timings["depth_s"] = round(time.time() - t0, 2)
+
+    h, w = keyframes[0].rgb.shape[:2]
+    K = intrinsics_for(w, h)
+    JOB.push("register", f"Intrínsecos estimados: fx={K[0, 0]:.1f} px, HFOV={CAMERA_HFOV_DEG:.0f} grados, textura {w}x{h}", 0.5)
+    t0 = time.time()
+    poses, reg_stats = register_keyframes(keyframes, K) if len(keyframes) > 1 else ([np.eye(4)], [{"method": "origin", "inliers": 0, "matches": 0}])
+    timings["registration_s"] = round(time.time() - t0, 2)
+
+    JOB.push("mesh", f"Desproyectando RGB-D a malla (zancada {step} px)...", 0.6)
+    t0 = time.time()
+    frame_meshes = [build_frame_mesh(kf.rgb, kf.depth, K, step) for kf in keyframes]
+    timings["mesh_s"] = round(time.time() - t0, 2)
+
+    t0 = time.time()
+    geo = export_scene(frame_meshes, poses, keyframes, K, step)
+    timings["export_s"] = round(time.time() - t0, 2)
+
+    previews = save_previews(keyframes)
+    timings["total_s"] = round(time.time() - t_start, 2)
+
+    meta = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "job_id": JOB.id,
+        "video": video_info, "depth": depth_info, "registration": reg_stats,
+        "geometry": geo, "previews": previews, "timings": timings,
+        "model_url": "/api/model", "pointcloud_url": "/api/model?format=ply", "video_url": "/api/video",
+    }
+    METADATA_JSON.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    JOB.push("done", f"Gemelo digital listo en {timings['total_s']} s: {geo['vertices']:,} vértices, "
+                     f"{geo['dimensions_m']['width']}x{geo['dimensions_m']['depth']} m", 1.0)
+    return meta
+
+
+def _pipeline_thread(video_path: Path, n_keyframes: int, step: int) -> None:
+    try:
+        run_pipeline(video_path, n_keyframes, step)
+        JOB.finish()
+    except PipelineError as e:
+        log.warning("Pipeline detenido: %s", e)
+        JOB.push("error", str(e))
+        JOB.finish(error=str(e))
+    except Exception as e:  # noqa: BLE001 - cualquier fallo inesperado debe reportarse, no tumbar el servidor
+        log.exception("Fallo inesperado en el pipeline")
+        msg = f"Error interno del pipeline: {type(e).__name__}: {e}"
+        JOB.push("error", msg)
+        JOB.finish(error=msg)
