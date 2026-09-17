@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 import logging
 import math
 import os
@@ -66,6 +67,11 @@ MODEL_PLY = OUTPUT_DIR / "scene.ply"
 METADATA_JSON = OUTPUT_DIR / "metadata.json"
 VIDEO_COPY = OUTPUT_DIR / "source_video.mp4"
 
+for _stream in (sys.stdout, sys.stderr):   # consolas Windows (cp1252) no soportan acentos/flechas
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("spatial-twin")
 for _noisy in ("httpx", "huggingface_hub", "urllib3", "filelock"):
@@ -441,12 +447,21 @@ def relative_pose_pnp(kf_a, kf_b, K: np.ndarray) -> Optional[dict]:
             "rotation_deg": round(float(np.degrees(np.linalg.norm(rvec))), 1)}
 
 
-def register_keyframes(keyframes: list, K: np.ndarray) -> tuple[list, list]:
+def register_keyframes(keyframes: list, K: np.ndarray, frame_w: int) -> tuple[list, list]:
     """
-    Encadena poses: mundo = cámara del keyframe 0. Para cada par consecutivo intenta PnP;
-    si falla, cae a un abanico rotacional (30° alrededor de Y) para que la escena siga siendo explorable.
+    Encadena poses: mundo = cámara del keyframe 0. Para cada par consecutivo intenta PnP; si falla,
+    coloca el keyframe en un abanico contiguo (separación = FOV horizontal real del fotograma) para
+    que la escena siga siendo explorable como un panorama. Si ningún par se registró, el abanico se
+    recentra alrededor de la dirección inicial de la cámara.
     Devuelve lista de matrices 4x4 'mundo<-cámara_i' y estadísticas de registro por keyframe.
     """
+    hfov_frame = 2.0 * math.atan(frame_w / (2.0 * K[0, 0]))          # FOV horizontal de este fotograma
+    spacing = hfov_frame * 1.04                                         # ligera separación para no solapar
+
+    def rot_y(a: float) -> np.ndarray:
+        return np.array([[math.cos(a), 0, math.sin(a), 0], [0, 1, 0, 0],
+                         [-math.sin(a), 0, math.cos(a), 0], [0, 0, 0, 1]])
+
     poses = [np.eye(4)]
     stats = [{"method": "origin", "inliers": 0, "matches": 0}]
     for i in range(1, len(keyframes)):
@@ -458,14 +473,13 @@ def register_keyframes(keyframes: list, K: np.ndarray) -> tuple[list, list]:
                                  f"|t|={rel['translation_m']} m, rot={rel['rotation_deg']} grados",
                      0.5 + 0.08 * i / len(keyframes))
         else:
-            ang = math.radians(30.0)
-            Ry = np.array([[math.cos(ang), 0, math.sin(ang), 0], [0, 1, 0, 0],
-                           [-math.sin(ang), 0, math.cos(ang), 0], [0, 0, 0, 1]])
-            pose = poses[-1] @ Ry
-            stats.append({"method": "fallback_fan", "inliers": 0, "matches": 0})
-            JOB.push("register", f"Keyframe {i}: sin geometría fiable, colocado en abanico (+30 grados)",
+            pose = poses[-1] @ rot_y(spacing)
+            stats.append({"method": "fallback_fan", "inliers": 0, "matches": 0, "fan_deg": round(math.degrees(spacing), 1)})
+            JOB.push("register", f"Keyframe {i}: solape insuficiente para PnP, colocado en abanico (+{math.degrees(spacing):.0f} grados)",
                      0.5 + 0.08 * i / len(keyframes))
-        poses.append(pose)
+    if len(poses) > 1 and all(st["method"] != "pnp_ransac" for st in stats[1:]):
+        recenter = rot_y(-spacing * (len(poses) - 1) / 2.0)             # centra el panorama frente al usuario
+        poses = [recenter @ p for p in poses]
     return poses, stats
 
 
@@ -638,7 +652,7 @@ def run_pipeline(video_path: Path, n_keyframes: int, step: int) -> dict:
     K = intrinsics_for(w, h)
     JOB.push("register", f"Intrínsecos estimados: fx={K[0, 0]:.1f} px, HFOV={CAMERA_HFOV_DEG:.0f} grados, textura {w}x{h}", 0.5)
     t0 = time.time()
-    poses, reg_stats = register_keyframes(keyframes, K) if len(keyframes) > 1 else ([np.eye(4)], [{"method": "origin", "inliers": 0, "matches": 0}])
+    poses, reg_stats = register_keyframes(keyframes, K, w) if len(keyframes) > 1 else ([np.eye(4)], [{"method": "origin", "inliers": 0, "matches": 0}])
     timings["registration_s"] = round(time.time() - t0, 2)
 
     JOB.push("mesh", f"Desproyectando RGB-D a malla (zancada {step} px)...", 0.6)
